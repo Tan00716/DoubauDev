@@ -45,8 +45,10 @@ src/
   gameplay/
     game-state.ts     # 游戏状态机（昼/夜/过渡/结算）+ 双层牌库 + 波次表
     combat.ts         # 夜间战斗循环：事件式固定伤害结算、接敌战意、波次状态机
+    spatial-grid.ts   # 空间分区网格（寻敌 O(实体×候选) → 只查附近 cell）
     __tests__/
-      combat.test.ts  # 战斗结算回归单测（B1/B2/B3/I3/I5/I6/I7 断言）
+      combat.test.ts  # 战斗结算回归单测（B1/B2/B3/I3/I5/I6/I7/N1/N3/N4/应急班夜末消散/空间网格一致性断言）
+      perf.test.ts    # 230 实体压测回归守卫（逻辑层平均帧耗时 < 8ms）
   renderer/
     scene.ts          # Three.js 场景：正交相机、实体网格管理、火圈资源池化
   ui/
