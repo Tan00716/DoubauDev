@@ -32,10 +32,26 @@ simulator/                     # 无头战斗数值模拟器（开发中，完�
 | 里程碑 | 状态 |
 |---|---|
 | 核心设计 + 技术规格 + 审计 + Steam 文案 | ✅ 定稿（审计 11 项问题已修复） |
-| M1 垂直切片（白天建堡+夜间守城+双层牌库+半自动操控） | 🚧 开发中 |
-| 无头战斗数值模拟器 | 🚧 开发中 |
-| MVP 可玩最小版本 | ⏳ 待 M1 验收后启动 |
+| M1 垂直切片（白天建堡+夜间守城+双层牌库+半自动操控） | ✅ 已完成（在线预览 + 源码已入库） |
+| 无头战斗数值模拟器 | ✅ 已完成（1000 局批量模拟 + 20/20 单测通过） |
+| MVP 可玩最小版本 | 🚧 待 M1 代码质检通过后启动 |
 | Full v1.0 / Steam 上架 | ⏳ 规划见 docs/04 |
+
+## 快速开始
+
+```bash
+# 游戏 M1 原型
+cd game
+npm install
+npm run dev        # 本地开发
+npm run build      # 生产构建
+
+# 战斗数值模拟器
+cd simulator
+npm install
+npm test           # 单测（20/20）
+npx tsx src/simulate.ts --runs 1000 --preset baseline --out report.json
+```
 
 ## 文档权威版本说明
 
