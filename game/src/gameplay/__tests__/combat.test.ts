@@ -305,7 +305,7 @@ describe('N1：紧急增援出牌预检与退款兜底', () => {
     expect(gameState.squads).toHaveLength(0);
   });
 
-  it('容量充足时正常召唤：扣 15 战意、卡进弃牌堆、应急盾卫入场', () => {
+  it('容量充足时正常召唤：扣 7 战意（定价终裁 rev32）、卡进弃牌堆、应急盾卫入场', () => {
     setupNightArena();
     gameState.warSpirit = 30;
     gameState.firstTacticFree = false; // 关闭首张免费被动，测付费路径
@@ -317,7 +317,8 @@ describe('N1：紧急增援出牌预检与退款兜底', () => {
 
     expect(ok).toBe(true);
     expect(gameState.canPlayTacticCard(reinforce)).toBe(true);
-    expect(gameState.warSpirit).toBe(15);
+    expect(gameState.warSpirit).toBe(23); // 30 - 7（定价终裁 rev32）
+    expect(reinforce.cost_night).toBe(7); // 校准锚点：增援牌定价 7 战意
     expect(gameState.tacticDiscard).toContain(reinforce);
     expect(gameState.squads).toHaveLength(1);
     expect(gameState.squads[0].unitId).toBe('unit_shieldbearer');
