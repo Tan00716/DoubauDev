@@ -82,7 +82,7 @@ describe('批次二·夜内空窗优化（验收指标）', () => {
     expect(idleRate).toBeLessThanOrEqual(0.4);
   });
 
-  it('第 4 夜（敌量增大，环形防御）：空窗率 ≤ 40%', () => {
+  it('第 4 夜（敌量增大，沿路线布防）：空窗率 ≤ 40%', () => {
     setupPaceNight(4, 2, true);
     expect(simulateNight(0.1)).toBe(true);
     const stat = gameState.nightIdleHistory[gameState.nightIdleHistory.length - 1];
