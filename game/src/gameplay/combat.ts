@@ -1,6 +1,7 @@
 import { gameState, type SquadEntity, type EnemyEntity, type BuildingEntity, type Position, getWaveComposition, TOTAL_WAVES, WAVE_GAP_SECONDS, WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC } from './game-state';
 import { getUnitData, getBuildingData, getEnemyData } from '../content/data';
 import { eventBus } from '../core/event-bus';
+import { SpatialGrid } from './spatial-grid';
 
 const MAP_SIZE = 30;
 const MAIN_KEEP_POS: Position = { x: 0, z: 0 };
@@ -8,14 +9,27 @@ const MAIN_KEEP_POS: Position = { x: 0, z: 0 };
 /** 夜间每 8 秒补抽 1 张战术牌（设计：卡牌系统·战术手牌）。 */
 const NIGHT_TACTIC_DRAW_INTERVAL = 8;
 
+// MVP 批次一·性能项：寻敌空间分区网格（cell 4 单位 ≈ 短程接敌范围的 2~3 倍，兼顾插入与查询成本）
+const squadGrid = new SpatialGrid<SquadEntity>(4, 34);
+const enemyGrid = new SpatialGrid<EnemyEntity>(4, 34);
+
 export function updateCombat(dt: number): void {
   if (gameState.phase !== 'night') return;
 
+  rebuildSpatialGrids();
   updateEffects(dt);
   updateEnemies(dt);
   updateSquads(dt);
   updateBuildings(dt);
   checkWaveProgress(dt);
+}
+
+/** 帧首重建空间网格（实体总量 ≤ 数百，重建成本远低于逐对扫描）。 */
+function rebuildSpatialGrids(): void {
+  squadGrid.clear();
+  for (const sq of gameState.squads) squadGrid.insert(sq);
+  enemyGrid.clear();
+  for (const en of gameState.enemies) enemyGrid.insert(en);
 }
 
 function updateEffects(dt: number): void {
@@ -75,6 +89,7 @@ function updateEnemies(dt: number): void {
     // Death check
     if (en.health <= 0) {
       gameState.removeEnemy(en.id);
+      enemyGrid.removeById(en.id);
       continue;
     }
 
@@ -139,6 +154,7 @@ function updateSquads(dt: number): void {
     // Death check —— 阵亡入受损归营堆（I3），由 game-state 统一结算
     if (sq.health <= 0) {
       gameState.squadDestroyed(sq);
+      squadGrid.removeById(sq.id);
       continue;
     }
 
@@ -306,17 +322,9 @@ function spawnWave(waveNumber: number): void {
   }
 }
 
+// 寻敌统一走空间网格（MVP 批次一·性能项）；建筑数量少（≤20）保留暴力扫描。
 function findNearestSquad(pos: Position, maxRange: number): SquadEntity | null {
-  let nearest: SquadEntity | null = null;
-  let minDist = maxRange;
-  for (const sq of gameState.squads) {
-    const d = distance(pos, sq.position);
-    if (d < minDist) {
-      minDist = d;
-      nearest = sq;
-    }
-  }
-  return nearest;
+  return squadGrid.queryNearest(pos, maxRange);
 }
 
 function findNearestBuilding(pos: Position, maxRange: number): BuildingEntity | null {
@@ -333,29 +341,11 @@ function findNearestBuilding(pos: Position, maxRange: number): BuildingEntity | 
 }
 
 function findNearestEnemy(pos: Position): EnemyEntity | null {
-  let nearest: EnemyEntity | null = null;
-  let minDist = Infinity;
-  for (const en of gameState.enemies) {
-    const d = distance(pos, en.position);
-    if (d < minDist) {
-      minDist = d;
-      nearest = en;
-    }
-  }
-  return nearest;
+  return enemyGrid.queryNearest(pos, Infinity);
 }
 
 function findNearestEnemyInRange(pos: Position, range: number): EnemyEntity | null {
-  let nearest: EnemyEntity | null = null;
-  let minDist = range;
-  for (const en of gameState.enemies) {
-    const d = distance(pos, en.position);
-    if (d < minDist) {
-      minDist = d;
-      nearest = en;
-    }
-  }
-  return nearest;
+  return enemyGrid.queryNearest(pos, range);
 }
 
 function moveToward(pos: Position, target: Position, speed: number): void {
