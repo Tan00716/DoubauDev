@@ -1,153 +1,114 @@
 import type { PresetConfig } from '../types/index.js';
 
 /**
- * Preset Build Configurations for Simulation
- * Two distinct builds for comparison
+ * 预设（Build + 策略）v2.1 —— 对齐 game deployArmoryCard 语义（commit 37f798f0）：
+ *
+ * 【关键口径】军械册每种卡唯一一张：
+ *  - 卡不在场 → 部署新实体（花 cost_day）；
+ *  - 实体已在场 → 同名再部署 = 升级（+50% maxHP/级，Lv3 封顶，仍花 cost_day）；
+ *  - 阵亡/被摧毁 → 卡入归营堆，次日 50% 修复后半血再落阵（升级清零）。
+ * 因此 M1 内不可能出现「2 个盾卫班 / 2 面墙」——
+ *  - 军令占用上限 = 盾卫1 + 弓手1 + 枪卒1 = 3 / 容量 6（永不阻塞）；
+ *  - 工令占用上限 = 城墙1 + 箭塔2 + 兵营2 = 5 / 容量 8（永不阻塞）。
+ * 三套 preset 的差异只来自：采购顺序（首夜阵容不同）、撤退血线、升级优先级。
+ *
+ * 采购抽象：每天最多 4 项采购/升级（玩家注意力上限），day 1 从 500 金币起步。
+ *
+ * 径向防线布局（layout）：对 game 2D 布阵的一维抽象。
+ * 敌人从半径 13.5 处入场，向主堡推进；前排班先接敌，
+ * 撤退/阵亡后敌人继续推进到城墙半径，逐层剥防线（与 combat.ts
+ * 「班组(1.5) → 建筑(1.5) → 主堡(2.0)」的索敌优先级一致）。
  */
 
 export const PRESETS: Record<string, PresetConfig> = {
   baseline: {
     name: 'baseline',
-    description: '均衡 Build：2盾卫 + 2弓手 + 2枪卒，城墙×3 + 箭塔×1 + 兵营×1',
+    description: '均衡：先成军（盾+枪+弓）再筑防（墙→塔→营），撤退血线 0.2',
     commander_id: 'commander_oen',
-    initial_gold: 500,
-    initial_squads: [
-      { unit_id: 'unit_shieldbearer' },
-      { unit_id: 'unit_shieldbearer' },
-      { unit_id: 'unit_archer' },
-      { unit_id: 'unit_archer' },
-      { unit_id: 'unit_pikeman' },
-      { unit_id: 'unit_pikeman' },
+    build_plan: [
+      'card_unit_shieldbearer',
+      'card_unit_pikeman',
+      'card_unit_archer',
+      'card_building_wall',
+      'card_building_arrow_tower',
+      'card_building_barracks',
     ],
-    initial_buildings: [
-      { building_id: 'building_wall' },
-      { building_id: 'building_wall' },
-      { building_id: 'building_wall' },
-      { building_id: 'building_arrow_tower' },
-      { building_id: 'building_barracks' },
+    upgrade_priority: [
+      'card_unit_shieldbearer',
+      'card_unit_pikeman',
+      'card_unit_archer',
+      'card_building_arrow_tower',
+      'card_building_wall',
+      'card_building_barracks',
     ],
-    waves: [
-      // Day 1: Tutorial - small wolf pack (1 route)
-      [
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 4 }], spawn_delay_seconds: 0 },
-      ],
-      // Day 2: Mixed small force (2 routes)
-      [
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 5 }, { enemy_id: 'enemy_shield_crusher', count: 1 }], spawn_delay_seconds: 0 },
-      ],
-      // Day 3: Shield push (2 routes)
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 4 }], spawn_delay_seconds: 0 },
-      ],
-      // Day 4: Burrowers appear (2 routes)
-      [
-        { enemies: [{ enemy_id: 'enemy_burrower', count: 2 }, { enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 5 }], spawn_delay_seconds: 0 },
-      ],
-      // Day 5: Heavy mixed (3 routes)
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 3 }, { enemy_id: 'enemy_burrower', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 6 }], spawn_delay_seconds: 0 },
-      ],
-      // Day 6: Elite night - 2 waves
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 3 }, { enemy_id: 'enemy_burrower', count: 3 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 10 }], spawn_delay_seconds: 20 },
-      ],
-      // Day 7: Siege pressure - 2 waves
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 4 }, { enemy_id: 'enemy_burrower', count: 3 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 10 }, { enemy_id: 'enemy_shield_crusher', count: 2 }], spawn_delay_seconds: 20 },
-      ],
-      // Day 8: Final siege - 3 waves
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 5 }, { enemy_id: 'enemy_burrower', count: 4 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 14 }, { enemy_id: 'enemy_shield_crusher', count: 4 }], spawn_delay_seconds: 15 },
-        { enemies: [{ enemy_id: 'enemy_burrower', count: 5 }, { enemy_id: 'enemy_shield_crusher', count: 5 }], spawn_delay_seconds: 20 },
-      ],
-    ],
+    retreat_threshold: 0.2,
+    layout: {
+      front_squad_radii: [10.5, 9.5, 8.5, 7.5, 6.5, 6.0],
+      archer_radius: 5.5,
+      wall_radius: 8.0,
+      tower_radius: 6.0,
+      barracks_radius: 4.0,
+    },
     max_days: 8,
-    difficulty: 0,
   },
 
   turtle: {
     name: 'turtle',
-    description: '龟城 Build：1盾卫 + 1枪卒，城墙×3 + 箭塔×2 + 兵营×1（薇拉指挥官）',
-    commander_id: 'commander_veira',
-    initial_gold: 500,
-    initial_squads: [
-      { unit_id: 'unit_shieldbearer' },
-      { unit_id: 'unit_pikeman' },
+    description: '龟城：先筑防（墙→塔）再成军，惜兵早撤（0.35），优先升塔墙',
+    commander_id: 'commander_oen',
+    build_plan: [
+      'card_building_wall',
+      'card_building_arrow_tower',
+      'card_unit_shieldbearer',
+      'card_unit_pikeman',
+      'card_building_barracks',
+      'card_unit_archer',
     ],
-    initial_buildings: [
-      { building_id: 'building_wall' },
-      { building_id: 'building_wall' },
-      { building_id: 'building_wall' },
-      { building_id: 'building_arrow_tower' },
-      { building_id: 'building_arrow_tower' },
-      { building_id: 'building_barracks' },
+    upgrade_priority: [
+      'card_building_arrow_tower',
+      'card_building_wall',
+      'card_unit_shieldbearer',
+      'card_unit_pikeman',
+      'card_unit_archer',
     ],
-    // Same waves as baseline for fair comparison
-    waves: [
-      [{ enemies: [{ enemy_id: 'enemy_wolf_pack', count: 4 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_wolf_pack', count: 5 }, { enemy_id: 'enemy_shield_crusher', count: 1 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 4 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_burrower', count: 2 }, { enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 5 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_shield_crusher', count: 3 }, { enemy_id: 'enemy_burrower', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 6 }], spawn_delay_seconds: 0 }],
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 3 }, { enemy_id: 'enemy_burrower', count: 2 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 8 }], spawn_delay_seconds: 20 },
-      ],
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_burrower', count: 1 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 4 }, { enemy_id: 'enemy_burrower', count: 1 }], spawn_delay_seconds: 20 },
-      ],
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_burrower', count: 2 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 5 }, { enemy_id: 'enemy_shield_crusher', count: 1 }], spawn_delay_seconds: 20 },
-      ],
-    ],
+    retreat_threshold: 0.35, // 龟城更惜兵：更早撤退保卡
+    layout: {
+      front_squad_radii: [10.5, 9.5],
+      archer_radius: 5.5,
+      wall_radius: 8.0,
+      tower_radius: 6.0,
+      barracks_radius: 4.0,
+    },
     max_days: 8,
-    difficulty: 0,
   },
 
   aggressive: {
     name: 'aggressive',
-    description: '激进 Build：3盾卫 + 2枪卒 + 1弓手，城墙×1 + 箭塔×1 + 兵营×1（高军团配比）',
+    description: '激进：全军先落（盾+枪+弓+营），工事最晚，硬顶输出（撤退血线 0.1）',
     commander_id: 'commander_oen',
-    initial_gold: 500,
-    initial_squads: [
-      { unit_id: 'unit_shieldbearer' },
-      { unit_id: 'unit_shieldbearer' },
-      { unit_id: 'unit_shieldbearer' },
-      { unit_id: 'unit_pikeman' },
-      { unit_id: 'unit_pikeman' },
-      { unit_id: 'unit_archer' },
+    build_plan: [
+      'card_unit_shieldbearer',
+      'card_unit_pikeman',
+      'card_unit_archer',
+      'card_building_barracks',
+      'card_building_arrow_tower',
+      'card_building_wall',
     ],
-    initial_buildings: [
-      { building_id: 'building_wall' },
-      { building_id: 'building_arrow_tower' },
-      { building_id: 'building_barracks' },
+    upgrade_priority: [
+      'card_unit_shieldbearer',
+      'card_unit_pikeman',
+      'card_unit_archer',
+      'card_building_arrow_tower',
     ],
-    waves: [
-      [{ enemies: [{ enemy_id: 'enemy_wolf_pack', count: 4 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_wolf_pack', count: 5 }, { enemy_id: 'enemy_shield_crusher', count: 1 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 4 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_burrower', count: 2 }, { enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 5 }], spawn_delay_seconds: 0 }],
-      [{ enemies: [{ enemy_id: 'enemy_shield_crusher', count: 3 }, { enemy_id: 'enemy_burrower', count: 2 }, { enemy_id: 'enemy_wolf_pack', count: 6 }], spawn_delay_seconds: 0 }],
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 3 }, { enemy_id: 'enemy_burrower', count: 2 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 8 }], spawn_delay_seconds: 20 },
-      ],
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_burrower', count: 1 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 4 }, { enemy_id: 'enemy_burrower', count: 1 }], spawn_delay_seconds: 20 },
-      ],
-      [
-        { enemies: [{ enemy_id: 'enemy_shield_crusher', count: 2 }, { enemy_id: 'enemy_burrower', count: 2 }], spawn_delay_seconds: 0 },
-        { enemies: [{ enemy_id: 'enemy_wolf_pack', count: 5 }, { enemy_id: 'enemy_shield_crusher', count: 1 }], spawn_delay_seconds: 20 },
-      ],
-    ],
+    retreat_threshold: 0.1, // 激进Build更晚撤退、硬顶输出
+    layout: {
+      front_squad_radii: [10.5, 9.5, 8.5, 7.5, 6.5, 6.0],
+      archer_radius: 5.5,
+      wall_radius: 8.0,
+      tower_radius: 6.0,
+      barracks_radius: 4.0,
+    },
     max_days: 8,
-    difficulty: 0,
   },
 };
 
