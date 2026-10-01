@@ -266,8 +266,8 @@ export class GameUI {
       const lvBadge = lvl > 0 ? `<div class="eh-card-lv">Lv${lvl + 1}</div>` : '';
       const damaged = gameState.damagedCamp.find(d => d.cardId === card.card_id);
       const damagedBadge = damaged ? `<div class="eh-card-damaged">受损×${damaged.count}</div>` : '';
-      const recalled = !damaged && gameState.recalledCards.has(card.card_id)
-        ? '<div class="eh-card-recalled">已修复·半血</div>' : '';
+      const recalled = !damaged && (gameState.recalledPending.get(card.card_id) ?? 0) > 0
+        ? '<div class="eh-card-recalled">已修复·免费落阵(半血)</div>' : '';
       const dimClass = damaged ? 'eh-card-dim' : '';
       html += `
         <div class="eh-card ${isSelected ? 'eh-card-selected' : ''} ${dimClass}" data-card="${card.card_id}">
@@ -416,7 +416,7 @@ export class GameUI {
       html += `
         <div class="eh-damaged-row">
           <span>${card?.card_name ?? d.cardId} ×${d.count}</span>
-          <button class="eh-repair-btn" data-repair="${d.cardId}">修复 ${cost}金</button>
+          <button class="eh-repair-btn" data-repair="${d.cardId}">修复 ${cost}金(含再入场)</button>
         </div>
       `;
     }
@@ -426,7 +426,7 @@ export class GameUI {
       btn.addEventListener('click', () => {
         const cardId = (btn as HTMLElement).dataset.repair!;
         if (gameState.repairDamagedCard(cardId)) {
-          this.showInfo('修复完成，再次落阵时半血入场');
+          this.showInfo('修复完成：点击卡牌免费落阵（半血入场），不再额外收费');
         } else {
           this.showInfo('金币不足，无法修复');
         }
