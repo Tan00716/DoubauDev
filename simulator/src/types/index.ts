@@ -1,192 +1,238 @@
 /**
- * EMBERHOLD Simulator - Core Type Definitions
- * Aligned with Web Tech Spec JSON Schema (Section 2)
+ * EMBERHOLD Simulator v2 - 类型定义
+ * 数值与常量全部对齐 game/（commit 37f798f0）：
+ *  - src/content/data.ts（单位/建筑/敌人/卡牌）
+ *  - src/gameplay/game-state.ts（容量、夜时长、波次表、战意、通关判定）
+ *  - src/gameplay/combat.ts（事件式固定伤害、冷却门控、盾墙/齐射/枪卒加成）
  */
 
-// ============ Content Data Types ============
+// ============ 常量（与 game-state.ts 逐一对应） ============
+
+export const DESIGN_MILITARY_CAPACITY = 6; // 军令容量
+export const DESIGN_WORK_CAPACITY = 8; // 工令容量
+export const NIGHT_DURATION = 240; // 夜时长（秒，兜底）
+export const TOTAL_WAVES = 3; // 每夜波数
+export const WAVE_GAP_SECONDS = 15; // 波次间隙
+export const WAVE_PREVIEW_LEAD_SECONDS = 5; // 首波威胁预演
+export const WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC = 0.5; // 接敌班每秒战意
+export const RETREAT_WAR_SPIRIT_BLOCK_SECONDS = 5; // 撤退战意封锁
+export const VICTORY_DAYS = 8; // 通关昼夜数
+export const WAR_SPIRIT_MAX = 40;
+export const MAIN_KEEP_MAX_HEALTH = 1000;
+export const STARTING_GOLD = 500;
+export const ENEMY_ATTACK_COOLDOWN = 1.0; // 敌方攻击冷却（事件式固定伤害）
+export const NIGHT_TACTIC_DRAW_INTERVAL = 8; // 夜间每 8 秒补抽 1 张
+export const TACTIC_HAND_SIZE = 5;
+export const NIGHT_TACTIC_DRAW_START = 3;
+export const GAP_DISCARD_DRAW = 2; // 波次间隙弃 2 抽 2
+export const MAP_SPAWN_RADIUS = 13.5; // MAP_SIZE(30) * 0.45
+export const KEEP_ENGAGE_RADIUS = 2.0; // 敌人距主堡 2.0 内开始攻击
+export const ENEMY_ENGAGE_RADIUS = 1.5; // 敌人对班组/建筑的索敌半径
+export const DAY_SQUAD_HEAL_RATIO = 0.2; // 昼间班组自愈 20%
+export const DAY_BUILDING_HEAL_RATIO = 0.3; // 昼间建筑自愈 30%
+export const WAR_SPIRIT_TO_GOLD_RATE = 0.5; // 夜末战意全额 50% 折算金币
+export const REPAIR_COST_RATIO = 0.5; // 受损归营堆修复 = cost_day × 50%
+export const UPGRADE_HP_PER_LEVEL = 0.5; // 同名牌升级：每级 maxHP +50%（仅血量，M1 无攻击加成）
+export const UPGRADE_MAX_LEVEL = 2; // Lv3 上限（0/1/2）
+
+export const DT = 0.25; // 模拟步长（秒）
+
+// ============ 内容数据类型（对齐 game/src/content/data.ts） ============
 
 export interface UnitData {
   unit_id: string;
   unit_name: string;
-  role: 'shield' | 'pike' | 'archer' | 'cavalry' | 'engineer' | 'healer' | 'mage' | 'behemoth';
   squad_size: number;
   military_cost: number;
   max_health: number;
   attack_damage: number;
   attack_range: number;
-  attack_speed: number;
+  attack_speed: number; // 注意：game 中 attack_speed 是冷却秒数（combat.ts: sq.attackCooldown = data.attack_speed）
   defense_type: 'heavy' | 'medium' | 'light' | 'none';
   move_speed: number;
-  armor: number;
-  war_spirit_on_contact: number;
-  synergy_tags: string[];
+  role: 'front' | 'ranged';
 }
 
 export interface BuildingData {
   building_id: string;
   building_name: string;
-  category: 'defense' | 'offense' | 'support' | 'utility';
   work_cost: number;
   gold_cost: number;
   max_durability: number;
-  armor: number;
-  attack_damage?: number;
-  attack_range?: number;
-  attack_speed?: number;
-  synergy_tags: string[];
+  attack_damage: number;
+  attack_range: number;
+  attack_speed: number; // 冷却秒数
+  heals_per_sec: number; // 兵营：每秒治疗
+  heal_radius: number;
 }
 
 export interface EnemyData {
   enemy_id: string;
   enemy_name: string;
-  type: 'tank' | 'swarm' | 'assassin' | 'siege' | 'anti_tower' | 'anti_army' | 'ranged' | 'healer' | 'summoner';
   max_health: number;
-  damage: number;
+  damage: number; // 事件式固定伤害（B1：不乘 dt）
   attack_range: number;
-  attack_speed: number;
   move_speed: number;
-  armor: number;
-  target_priority: 'wall' | 'tower' | 'main_keep' | 'squad';
-  countered_by: string[];
+  reward_gold: number;
+  reward_war_spirit: number;
 }
 
-export interface CommanderData {
-  commander_id: string;
-  commander_name: string;
-  passive_effects: CommanderEffect[];
-  starting_gold_bonus: number;
-  starting_military_capacity: number;
-  starting_work_capacity: number;
-  exclusive_unit_bonus?: { unit_id: string; multiplier: number };
-  build_identity: string[];
+export interface CardData {
+  card_id: string;
+  card_name: string;
+  layer: 'armory' | 'tactic';
+  category: 'unit' | 'building' | 'tactic' | 'formation';
+  cost_day: number; // 白天金币
+  cost_night: number; // 夜间战意
+  duration: number; // 战术牌持续秒数
 }
 
-export interface CommanderEffect {
-  type: string;
-  params: Record<string, number | string | boolean>;
+// ============ 难度收紧变体 ============
+
+export interface DifficultyVariant {
+  name: string;
+  description: string;
+  /** 各敌人数量乘数（作用于波次表 count） */
+  count_multiplier: number;
+  /** 敌人血量乘数 */
+  hp_multiplier?: number;
+  /** 敌人伤害乘数 */
+  damage_multiplier?: number;
+  /** 敌人移速乘数（测试与难度调参用；0 = 固定靶） */
+  speed_multiplier?: number;
+  /** 波次构成覆写（可选，直接替换 getWaveComposition 结果） */
+  wave_override?: (day: number, wave: number) => { enemyId: string; count: number }[];
 }
 
-// ============ Runtime Simulation Types ============
+// ============ 预设（Build + 策略） ============
 
-export interface SquadInstance {
-  instance_id: string;
-  unit_id: string;
-  health: number;
-  max_health: number;
-  position: 'front' | 'mid' | 'back';
-  is_engaged: boolean;
-  is_retreating: boolean;
-  retreat_timer: number;
-  kills_this_night: number;
-  war_spirit_generated: number;
+export interface PurchaseStep {
+  card_id: string; // 军械册卡（同 game card_id）
 }
-
-export interface BuildingInstance {
-  instance_id: string;
-  building_id: string;
-  durability: number;
-  max_durability: number;
-  is_destroyed: boolean;
-}
-
-export interface EnemyInstance {
-  instance_id: string;
-  enemy_id: string;
-  health: number;
-  max_health: number;
-  position: number; // 0-100, distance to main keep
-}
-
-export interface WaveConfig {
-  enemies: { enemy_id: string; count: number }[];
-  spawn_delay_seconds: number;
-}
-
-export interface GameState {
-  day: number;
-  phase: 'day' | 'night' | 'settlement';
-  gold: number;
-  war_spirit: number;
-  max_war_spirit: number;
-  military_capacity: number;
-  work_capacity: number;
-  main_keep_health: number;
-  max_main_keep_health: number;
-  squads: SquadInstance[];
-  buildings: BuildingInstance[];
-  damaged_camp: { unit_id: string; health: number }[];
-  deck_armory: string[];
-  deck_tactic: string[];
-  hand: string[];
-  discard_pile: string[];
-  cards_played_this_night: number;
-  total_gold_earned: number;
-  total_gold_spent: number;
-  total_war_spirit_generated: number;
-  total_war_spirit_spent: number;
-  casualties: number;
-  enemy_kills: number;
-  is_game_over: boolean;
-  victory: boolean;
-  defeat_reason: string | null;
-  war_spirit_curve: number[];
-  gold_curve: number[];
-}
-
-// ============ Simulation Config Types ============
 
 export interface PresetConfig {
   name: string;
   description: string;
-  commander_id: string;
-  initial_gold: number;
-  initial_squads: { unit_id: string }[];
-  initial_buildings: { building_id: string }[];
-  waves: WaveConfig[][];
+  commander_id: 'commander_oen'; // M1 仅奥恩一名指挥官（被动：每夜第一张战术牌免费）
+  /** 白天采购顺序（day 1 起按金币与容量允许逐项执行） */
+  build_plan: string[];
+  /** 全部落阵后的升级优先级（同名牌升级，Lv 上限 3） */
+  upgrade_priority: string[];
+  /** 班组自动撤退血线（占 maxHP 比例） */
+  retreat_threshold: number;
+  /** 防线半径布局（对 game 2D 布阵的径向抽象） */
+  layout: {
+    front_squad_radii: number[]; // 前排班（盾卫/枪卒）由外向内
+    archer_radius: number;
+    wall_radius: number;
+    tower_radius: number;
+    barracks_radius: number;
+  };
   max_days: number;
-  difficulty: number;
 }
 
-export interface SimulationConfig {
-  runs: number;
-  preset: string;
-  seed?: number;
-  max_parallel?: number;
+// ============ 运行时实体 ============
+
+export interface SimSquad {
+  id: string;
+  unit_id: string;
+  health: number;
+  max_health: number;
+  radius: number;
+  upgrade_level: number; // 0/1/2
+  on_field: boolean; // false = 已撤退（当夜离场，次日回归）
+  is_emergency: boolean; // 紧急增援（夜末消散）
+  attack_cooldown: number;
+  war_spirit_block_timer: number;
+  damage_dealt: number;
+  attacks: number;
+  kills: number;
 }
 
-// ============ Report Types ============
+export interface SimBuilding {
+  id: string;
+  building_id: string;
+  health: number;
+  max_health: number;
+  radius: number;
+  upgrade_level: number;
+  destroyed: boolean;
+  attack_cooldown: number;
+}
+
+export interface SimEnemy {
+  id: string;
+  enemy_id: string;
+  health: number;
+  max_health: number;
+  dist: number; // 距主堡的径向距离
+  speed_factor: number; // 入场角度差异的抽象（到达时间错峰）
+  attack_cooldown: number;
+}
+
+// ============ 报告类型 ============
+
+export interface NightStat {
+  day: number;
+  duration: number; // 实际夜时长
+  end_reason: 'cleared' | 'timeout_240s' | 'main_keep_destroyed';
+  idle_seconds: number; // 无敌人存活/接敌的空窗秒数（含预演+间隙）
+  engaged_seconds: number; // 至少一个班接敌的秒数
+  enemies_total: number;
+  kills: number;
+  squad_losses: number; // 阵亡（进归营堆）
+  squad_retreats: number; // 撤退保卡
+  tactic_cards_played: number;
+  war_spirit_generated: number;
+  gold_earned: number;
+}
 
 export interface SingleRunReport {
   run_id: number;
   preset_name: string;
+  variant_name: string;
   victory: boolean;
   days_survived: number;
-  defeat_reason: string | null;
+  defeat_reason: string | null; // 如 'main_keep_destroyed'
   final_gold: number;
   final_main_keep_health: number;
   total_casualties: number;
+  total_retreats: number;
   total_enemy_kills: number;
-  war_spirit_curve: number[];
-  gold_curve: number[];
-  avg_ttc_per_day: number[]; // Time To Clear (seconds)
-  avg_ttk_per_day: number[]; // Time To Kill (seconds)
-  build_diversity_score: number;
+  gold_curve: number[]; // 每夜结束后的金币
+  night_stats: NightStat[];
+  // 容量压力分析（军令 6 / 工令 8）
+  military_blocked: number; // 因军令容量被阻塞的购买/部署次数
+  work_blocked: number; // 因工令容量被阻塞的购买/部署次数
+  work_blocked_gold_left: number[]; // 被阻塞时的剩余金币（判断是否"有钱没容量"）
+  upgrades_bought: number;
+  repairs_bought: number;
 }
 
 export interface BatchReport {
   batch_id: string;
   preset_name: string;
+  variant_name: string;
   total_runs: number;
   victory_rate: number;
   avg_days_survived: number;
   median_days_survived: number;
-  victory_rate_by_day: Record<number, number>;
+  survival_rate_by_day: Record<number, number>; // 到达该夜者中守住该夜的比例
   defeat_reason_distribution: Record<string, number>;
+  defeat_day_distribution: Record<number, number>;
+  avg_final_gold: number;
+  avg_final_keep_health: number;
   avg_gold_curve: number[];
-  avg_war_spirit_curve: number[];
-  avg_casualties_per_day: number[];
-  avg_ttc_per_day: number[];
-  avg_ttk_per_day: number[];
+  avg_casualties: number;
+  avg_retreats: number;
+  avg_night_duration: number[]; // 各夜平均时长
+  avg_night_idle_ratio: number[]; // 各夜平均空窗占比
+  night_timeout_count: number[]; // 各夜 240s 兜底结算次数
+  avg_military_blocked: number;
+  avg_work_blocked: number;
+  work_blocked_with_gold_rate: number; // 被工令阻塞且金币足够的比例（天数口径）
+  avg_upgrades: number;
+  avg_repairs: number;
   balance_flags: BalanceFlag[];
   runs: SingleRunReport[];
 }
