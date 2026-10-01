@@ -13,9 +13,10 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@types/three": "^0.160.0",
+    "happy-dom": "^20.14.5",
     "typescript": "^5.3.3",
     "vite": "^5.0.10",
-    "@types/three": "^0.160.0",
     "vitest": "^1.6.0"
   }
 }
