@@ -1,0 +1,17 @@
+{
+  "name": "emberhold-battle-simulator",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "《烬堡 EMBERHOLD》战斗数值模拟器 v2 —— 对齐 M1 修复后（commit 37f798f0）的战斗模型",
+  "scripts": {
+    "simulate": "tsx src/cli/simulate.ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
