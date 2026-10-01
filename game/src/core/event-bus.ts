@@ -19,6 +19,7 @@ export type GameEventType =
   | 'wave-preview'
   | 'entity-upgraded'
   | 'damaged-camp-changed'
+  | 'military-changed'
   | 'tick';
 
 export interface GameEvent {
