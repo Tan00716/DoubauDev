@@ -2,11 +2,32 @@
   "name": "emberhold-m1",
   "version": "0.1.0",
   "type": "module",
+  "main": "electron/dist/main.js",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "electron:tsc": "tsc -p electron/tsconfig.json",
+    "electron:verify": "tsc -p electron/tsconfig.json --noEmit",
+    "electron:dev": "npm run build && npm run electron:tsc && cross-env NODE_ENV=development electron .",
+    "electron:build": "npm run build && npm run electron:tsc && electron-builder --win",
+    "electron:build:all": "npm run build && npm run electron:tsc && electron-builder --win --mac --linux"
+  },
+  "build": {
+    "appId": "com.emberhold.game",
+    "productName": "Emberhold",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/dist/**/*",
+      "electron/package.json"
+    ],
+    "win": {
+      "target": ["nsis", "zip"]
+    }
   },
   "dependencies": {
     "three": "^0.160.0",
@@ -14,6 +35,9 @@
   },
   "devDependencies": {
     "@types/three": "^0.160.0",
+    "cross-env": "^7.0.3",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
     "happy-dom": "^20.14.5",
     "typescript": "^5.3.3",
     "vite": "^5.0.10",
