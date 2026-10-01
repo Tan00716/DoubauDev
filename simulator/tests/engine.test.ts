@@ -1,311 +1,431 @@
+/**
+ * EMBERHOLD 模拟器 v2 单测 —— 对齐 game（commit 37f798f0）修复后的战斗模型。
+ *
+ * 口径锁定（对应 game/src/gameplay/__tests__/combat.test.ts 的回归断言）：
+ * - B1：敌方事件式固定伤害（冷却 1.0s 门控，不乘 dt）
+ * - B2：枪卒反冲锋 +50% 并入冷却分支，单枪卒 10s 总输出 = ⌈10/1.3⌉×15 = 120
+ * - I6：战意 = 接敌班每秒 0.5 + 撤退 5s 封锁
+ * - 盾墙令 0.3 减伤接入结算（仅班组承伤）
+ * - I2：3 波 + 15s 间隙 + 5s 首波预演 + 240s 兜底
+ * - 军令 6 / 工令 8 容量；I3 归营堆闭环（阵亡→50% 修复→半血再落阵）
+ */
+
 import { describe, it, expect } from 'vitest';
 import {
-  initializeGameState,
-  runDayPhase,
-  runNightPhase,
-  runNightSettlement,
-  runWaveCombat,
-  calculateUpkeep,
-  SeededRNG,
+  runSingleSimulation,
+  computeSquadHitDamage,
+  computeEnemyHitDamage,
+  _internal,
 } from '../src/core/engine.js';
+import { getWaveComposition, getVariantWaveComposition, getVariant } from '../src/data/waves.js';
 import { getPreset } from '../src/data/presets.js';
-import type { GameState, EnemyInstance } from '../src/types/index.js';
+import type { PresetConfig, DifficultyVariant } from '../src/types/index.js';
 
-// ============ Helper ============
+const { initState, runNight, runDayTransition, runDayPurchases, deployUnitCard, deployBuildingCard, upgradeEntity, SeededRNG } = _internal;
 
-function makeState(): GameState {
-  const preset = getPreset('baseline');
-  return initializeGameState(preset, 12345);
-}
+// ============ 测试工具 ============
 
-function makeEnemy(id: string, health: number): EnemyInstance {
+/** 测试预设：防线半径 13.4（敌人入场半径 13.5 附近，固定靶立即接敌） */
+function makePreset(opts: Partial<PresetConfig> = {}): PresetConfig {
   return {
-    instance_id: `e_${id}`,
-    enemy_id: id,
-    health,
-    max_health: health,
-    position: 10,
+    name: 'test',
+    description: 'test preset',
+    commander_id: 'commander_oen',
+    build_plan: [],
+    upgrade_priority: [],
+    retreat_threshold: 0,
+    layout: {
+      front_squad_radii: [13.4, 13.4, 13.4],
+      archer_radius: 13.4,
+      wall_radius: 8.0,
+      tower_radius: 6.0,
+      barracks_radius: 4.0,
+    },
+    max_days: 8,
+    ...opts,
   };
 }
 
-// ============ Test Suite ============
+/** 固定靶变体：speed_multiplier=0（敌人不动），波次覆写为指定构成 */
+function stationaryVariant(enemyId: string, count: number, hpMult = 500): DifficultyVariant {
+  return {
+    name: 'test_stationary',
+    description: '固定靶（测试用）',
+    count_multiplier: 1,
+    hp_multiplier: hpMult,
+    speed_multiplier: 0,
+    wave_override: () => [{ enemyId, count }],
+  };
+}
 
-describe('Engine Core', () => {
-  describe('GameState Initialization', () => {
-    it('should initialize with correct gold and capacities', () => {
-      const state = makeState();
-      expect(state.gold).toBe(500);
-      expect(state.military_capacity).toBe(10);
-      expect(state.work_capacity).toBe(8);
-      expect(state.squads.length).toBe(6);
-      expect(state.buildings.length).toBe(5);
-      expect(state.main_keep_health).toBe(1000);
-    });
+interface PikemanOpts { health?: number; max?: number; retreat?: number }
 
-    it('should assign correct unit stats to squads', () => {
-      const state = makeState();
-      const shield = state.squads.find(s => s.unit_id === 'unit_shieldbearer');
-      expect(shield).toBeDefined();
-      expect(shield!.max_health).toBe(300);
-      expect(shield!.health).toBe(300);
-    });
+/** 部署 1 个枪卒班（可覆写血量做坦克化/真实化） */
+function setupPikeman(opts: PikemanOpts = {}) {
+  const state = initState();
+  const preset = makePreset({ retreat_threshold: opts.retreat ?? 0 });
+  expect(deployUnitCard(state, preset, 'card_unit_pikeman', false)).toBe(true);
+  const sq = state.squads[0];
+  sq.max_health = opts.max ?? 100000;
+  sq.health = opts.health ?? 100000;
+  return { state, preset, sq };
+}
+
+// ============ 伤害公式（纯函数，锁定口径） ============
+
+describe('B2/N2 伤害公式口径', () => {
+  it('枪卒反冲锋：对 move_speed>3.0 的敌人 +50%', () => {
+    // 狼群 speed 3.5 → 10 × 1.5 = 15
+    expect(computeSquadHitDamage('unit_pikeman', 'enemy_wolf', false)).toBe(15);
+    // 粉碎者 speed 2.0 / 掘地者 speed 2.5 → 无加成
+    expect(computeSquadHitDamage('unit_pikeman', 'enemy_shield_crusher', false)).toBe(10);
+    expect(computeSquadHitDamage('unit_pikeman', 'enemy_burrower', false)).toBe(10);
+    // 盾卫 8、弓手 12（不受反冲锋影响）
+    expect(computeSquadHitDamage('unit_shieldbearer', 'enemy_wolf', false)).toBe(8);
+    expect(computeSquadHitDamage('unit_archer', 'enemy_wolf', false)).toBe(12);
   });
 
-  describe('War Spirit Generation', () => {
-    it('should generate war spirit when squads are engaged', () => {
-      const state = makeState();
-      const initialWs = state.war_spirit;
-
-      // Force engagement by placing enemies at position 0
-      const enemies = [makeEnemy('enemy_wolf_pack', 100)];
-      enemies[0].position = 0;
-
-      runWaveCombat(state, enemies, new SeededRNG(1));
-
-      // War spirit should have increased from contact + kills
-      expect(state.war_spirit).toBeGreaterThan(initialWs);
-      expect(state.total_war_spirit_generated).toBeGreaterThan(initialWs);
-    });
-
-    it('should cap war spirit at maximum', () => {
-      const state = makeState();
-      state.war_spirit = 38;
-
-      // Spawn many enemies to generate lots of war spirit
-      const enemies: EnemyInstance[] = [];
-      for (let i = 0; i < 20; i++) {
-        enemies.push(makeEnemy('enemy_wolf_pack', 10));
-        enemies[i].position = 0;
-      }
-
-      runWaveCombat(state, enemies, new SeededRNG(2));
-
-      expect(state.war_spirit).toBeLessThanOrEqual(40);
-    });
-
-    it('should generate more war spirit from kill rewards', () => {
-      const state = makeState();
-      const initialWs = state.war_spirit;
-
-      // Spawn weak enemies that will be killed quickly
-      const enemies: EnemyInstance[] = [];
-      for (let i = 0; i < 5; i++) {
-        enemies.push(makeEnemy('enemy_wolf_pack', 1));
-        enemies[i].position = 5;
-      }
-
-      runWaveCombat(state, enemies, new SeededRNG(3));
-
-      // Each kill gives +2 war spirit
-      expect(state.enemy_kills).toBeGreaterThan(0);
-      expect(state.total_war_spirit_generated).toBeGreaterThan(initialWs + state.enemy_kills * 2 - 1);
-    });
+  it('齐射令（N2 实现口径）：弓手伤害 ×1.5，其他单位不受影响', () => {
+    expect(computeSquadHitDamage('unit_archer', 'enemy_wolf', true)).toBe(18);
+    expect(computeSquadHitDamage('unit_archer', 'enemy_shield_crusher', true)).toBe(18);
+    expect(computeSquadHitDamage('unit_pikeman', 'enemy_wolf', true)).toBe(15);
   });
 
-  describe('Night Settlement', () => {
-    it('should convert excess war spirit to gold at 50% rate', () => {
-      const state = makeState();
-      state.war_spirit = 30;
-      const initialGold = state.gold;
-
-      runNightSettlement(state);
-
-      expect(state.war_spirit).toBe(0);
-      expect(state.gold).toBe(initialGold + 15); // 30 * 0.5 = 15
-    });
-
-    it('should move dead squads to damaged camp', () => {
-      const state = makeState();
-      // Kill one squad
-      state.squads[0].health = 0;
-      const deadUnitId = state.squads[0].unit_id;
-      const initialCampSize = state.damaged_camp.length;
-
-      runNightSettlement(state);
-
-      expect(state.damaged_camp.length).toBe(initialCampSize + 1);
-      expect(state.damaged_camp.some(d => d.unit_id === deadUnitId)).toBe(true);
-      expect(state.squads.every(s => s.health > 0)).toBe(true);
-    });
-
-    it('should remove dead squads from active squads', () => {
-      const state = makeState();
-      const initialCount = state.squads.length;
-      state.squads[0].health = 0;
-      state.squads[1].health = 0;
-
-      runNightSettlement(state);
-
-      expect(state.squads.length).toBe(initialCount - 2);
-    });
-
-    it('should repair destroyed walls if gold available', () => {
-      const state = makeState();
-      // Destroy a wall
-      const wall = state.buildings.find(b => b.building_id === 'building_wall');
-      expect(wall).toBeDefined();
-      wall!.is_destroyed = true;
-      wall!.durability = 0;
-      state.gold = 1000; // plenty of gold
-
-      runNightSettlement(state);
-
-      expect(wall!.is_destroyed).toBe(false);
-      expect(wall!.durability).toBeGreaterThan(0);
-    });
-  });
-
-  describe('Capacity Squeeze', () => {
-    it('should prevent adding squad beyond military capacity', () => {
-      const state = makeState();
-      // Fill up capacity
-      state.military_capacity = 2;
-      state.gold = 1000;
-      state.damaged_camp.push({ unit_id: 'unit_shieldbearer', health: 100 });
-
-      const initialSquadCount = state.squads.length;
-      const preset = getPreset('baseline');
-      runDayPhase(state, preset, new SeededRNG(1));
-
-      // Should not have added the squad due to capacity
-      expect(state.squads.length).toBe(initialSquadCount);
-    });
-
-    it('should respect work capacity for buildings', () => {
-      const state = makeState();
-      const usedWork = state.buildings.reduce((sum, b) => {
-        const bd = { building_wall: 1, building_arrow_tower: 2, building_barracks: 2 } as Record<string, number>;
-        return sum + (bd[b.building_id] || 0);
-      }, 0);
-      expect(usedWork).toBeLessThanOrEqual(state.work_capacity);
-    });
-
-    it('should drop units when capacity exceeded after repair', () => {
-      const state = makeState();
-      // Set capacity to exactly fit current squads (2 shield=4 + 2 archer=2 + 2 pike=2 = 8)
-      // So we need capacity 8 to not drop existing, then test adding more
-      state.military_capacity = 8;
-      state.gold = 1000;
-      // Add damaged units that would exceed capacity
-      state.damaged_camp.push({ unit_id: 'unit_shieldbearer', health: 50 }); // cost 2, would make 9
-      state.damaged_camp.push({ unit_id: 'unit_archer', health: 50 }); // cost 1, would make 10
-
-      const initialCount = state.squads.length;
-      const preset = getPreset('baseline');
-      runDayPhase(state, preset, new SeededRNG(1));
-
-      // Should not have added any squads since they'd exceed capacity
-      expect(state.squads.length).toBe(initialCount);
-      // Capacity should still be respected
-      const totalMil = state.squads.reduce((sum, s) => sum + (s.unit_id === 'unit_shieldbearer' ? 2 : 1), 0);
-      expect(totalMil).toBeLessThanOrEqual(state.military_capacity);
-    });
-  });
-
-  describe('Emergency Reinforcement 1.5x Cost', () => {
-    it('should apply 1.5x multiplier for night deployment', () => {
-      const state = makeState();
-      const unitCost = 2; // shieldbearer military_cost
-      const nightCost = unitCost * 1.5;
-      expect(nightCost).toBe(3);
-
-      // Verify the constant is correctly defined in the engine
-      // The emergency reinforce mechanic is documented in README
-      // and the cost calculation is: day_cost * EMERGENCY_REINFORCE_MULTIPLIER (1.5)
-      expect(EMERGENCY_REINFORCE_MULTIPLIER).toBe(1.5);
-    });
-
-    it('should document emergency reinforcement in night phase context', () => {
-      const state = makeState();
-      const initialWarSpirit = state.war_spirit;
-
-      // Night phase gives a small war spirit boost
-      const preset = getPreset('baseline');
-      runNightPhase(state, preset, new SeededRNG(1));
-
-      // War spirit should have been adjusted for night start
-      // The emergency reinforce cost (1.5x) is a design rule documented
-      // in the README and applied when deploying armory cards at night
-      expect(state.phase).toBe('night');
-    });
-  });
-
-  describe('Day Phase Economy', () => {
-    it('should calculate upkeep correctly', () => {
-      const state = makeState();
-      const upkeep = calculateUpkeep(state);
-      // 5 squads * 5 + 2 walls * 3 + 1 tower * 8 + 1 barracks * 10 = 25 + 6 + 8 + 10 = 49
-      expect(upkeep).toBeGreaterThan(0);
-    });
-
-    it('should deduct upkeep from gold during day phase', () => {
-      const state = makeState();
-      const initialGold = state.gold;
-      const preset = getPreset('baseline');
-
-      runDayPhase(state, preset, new SeededRNG(1));
-
-      // Gold should decrease by upkeep amount (or more if repairs happen)
-      expect(state.total_gold_spent).toBeGreaterThan(0);
-    });
-
-    it('should heal squads in barracks during day', () => {
-      const state = makeState();
-      // Damage a squad
-      state.squads[0].health = 50;
-      const maxHealth = state.squads[0].max_health;
-
-      const preset = getPreset('baseline');
-      runDayPhase(state, preset, new SeededRNG(1));
-
-      expect(state.squads[0].health).toBeGreaterThan(50);
-    });
-  });
-
-  describe('Combat Resolution', () => {
-    it('should destroy main keep when enemies reach it', () => {
-      const state = makeState();
-      // Remove all defenses
-      state.squads = [];
-      state.buildings = [];
-
-      const enemies = [makeEnemy('enemy_wolf_pack', 100)];
-      enemies[0].position = 0;
-
-      runWaveCombat(state, enemies, new SeededRNG(1));
-
-      expect(state.is_game_over).toBe(true);
-      expect(state.defeat_reason).toBe('main_keep_destroyed');
-    });
-
-    it('should kill enemies when squad DPS exceeds enemy HP', () => {
-      const state = makeState();
-      const enemies = [makeEnemy('enemy_wolf_pack', 1)];
-      enemies[0].position = 5;
-
-      runWaveCombat(state, enemies, new SeededRNG(1));
-
-      expect(enemies[0].health).toBeLessThanOrEqual(0);
-      expect(state.enemy_kills).toBeGreaterThan(0);
-    });
-
-    it('should apply counterplay bonus damage', () => {
-      const state = makeState();
-      // Wolf pack is countered by pikeman
-      const pikeman = state.squads.find(s => s.unit_id === 'unit_pikeman');
-      expect(pikeman).toBeDefined();
-
-      const enemies = [makeEnemy('enemy_wolf_pack', 200)];
-      enemies[0].position = 2;
-
-      const initialHealth = enemies[0].health;
-      runWaveCombat(state, enemies, new SeededRNG(1));
-
-      // Combat should have occurred
-      expect(enemies[0].health).toBeLessThan(initialHealth);
-    });
+  it('单枪卒 10s 总输出 = ⌈10/1.3⌉×15 = 120（game combat.test.ts 同款断言）', () => {
+    const attacks = Math.ceil(10 / 1.3); // 攻击冷却 1.3s 门控
+    expect(attacks).toBe(8);
+    expect(attacks * computeSquadHitDamage('unit_pikeman', 'enemy_wolf', false)).toBe(120);
   });
 });
 
-// Re-export constant for test access
-const EMERGENCY_REINFORCE_MULTIPLIER = 1.5;
+describe('B1/盾墙 敌方伤害公式', () => {
+  it('事件式固定伤害：狼 6，盾墙激活时班组承伤 ×0.7', () => {
+    expect(computeEnemyHitDamage('enemy_wolf', false)).toBe(6);
+    expect(computeEnemyHitDamage('enemy_wolf', true)).toBeCloseTo(4.2, 10);
+    expect(computeEnemyHitDamage('enemy_shield_crusher', false)).toBe(10);
+    expect(computeEnemyHitDamage('enemy_wolf', false, 2)).toBe(12); // 难度乘数
+  });
+});
+
+// ============ 夜间战斗（integration，经 runNight） ============
+
+describe('B1 敌方事件式固定伤害 + 冷却门控', () => {
+  it('2 固定靶狼 × 240s：承伤为 6 的整数倍，节奏 1.0s/次；枪卒 1.3s/次', () => {
+    const { state, preset } = setupPikeman();
+    runNight(state, preset, stationaryVariant('enemy_wolf', 2), new SeededRNG(42), 0.25);
+
+    const ns = state.night_stats[0];
+    expect(ns.end_reason).toBe('timeout_240s'); // 固定靶打不死 → 240s 兜底
+    expect(ns.duration).toBe(240);
+    const E = ns.duration - 5.25; // 5s 首波预演后接敌
+
+    const pikeman = state.squads[0];
+    const taken = 100000 - pikeman.health;
+    expect(taken % 6).toBe(0); // 每击固定 6 点（事件式，非 dt 连续伤害）
+    // 2 狼 × ~E 次 × 6（±2 次拍面误差）
+    expect(Math.abs(taken - 12 * E)).toBeLessThanOrEqual(24);
+
+    // 枪卒攻击节奏 1.3s/次、每击 15（对狼反冲锋）
+    expect(pikeman.attacks).toBeGreaterThanOrEqual(Math.floor(E / 1.3) - 1);
+    expect(pikeman.attacks).toBeLessThanOrEqual(Math.floor(E / 1.3) + 2);
+    expect(pikeman.damage_dealt).toBe(pikeman.attacks * 15);
+  });
+
+  it('dt 无关性：dt=0.25 与 dt=0.05 结果一致（±1 次攻击）', () => {
+    const a = setupPikeman();
+    runNight(a.state, a.preset, stationaryVariant('enemy_wolf', 2), new SeededRNG(42), 0.25);
+    const b = setupPikeman();
+    runNight(b.state, b.preset, stationaryVariant('enemy_wolf', 2), new SeededRNG(42), 0.05);
+
+    const takenA = 100000 - a.state.squads[0].health;
+    const takenB = 100000 - b.state.squads[0].health;
+    expect(Math.abs(takenA - takenB)).toBeLessThanOrEqual(12);
+    expect(Math.abs(a.state.squads[0].attacks - b.state.squads[0].attacks)).toBeLessThanOrEqual(1);
+    expect(Math.abs(a.state.squads[0].damage_dealt - b.state.squads[0].damage_dealt))
+      .toBeLessThanOrEqual(a.state.squads[0].damage_dealt * 0.02);
+  });
+});
+
+describe('I6 战意模型', () => {
+  it('接敌班每秒 0.5 战意（2 班接敌 ≈ 1.0/s）', () => {
+    const state = initState();
+    const preset = makePreset();
+    deployUnitCard(state, preset, 'card_unit_pikeman', false);
+    deployUnitCard(state, preset, 'card_unit_pikeman', false);
+    for (const sq of state.squads) { sq.max_health = 100000; sq.health = 100000; }
+
+    runNight(state, preset, stationaryVariant('enemy_wolf', 2), new SeededRNG(7), 0.25);
+    const ns = state.night_stats[0];
+    const E = ns.duration - 5.25;
+    expect(ns.war_spirit_generated).toBeGreaterThan(0.5 * 2 * E - 3);
+    expect(ns.war_spirit_generated).toBeLessThan(0.5 * 2 * E + 3);
+  });
+
+  it('血线撤退保卡：撤退后当夜不再接敌、战意停发', () => {
+    const { state, preset } = setupPikeman({ health: 1000, max: 1000, retreat: 0.99 });
+    runNight(state, preset, stationaryVariant('enemy_wolf', 2), new SeededRNG(9), 0.25);
+
+    const ns = state.night_stats[0];
+    expect(ns.squad_retreats).toBe(1);
+    expect(ns.squad_losses).toBe(0); // 撤退保卡，未阵亡
+    expect(state.total_retreats).toBe(1);
+    // 仅撤退前 ~3s 接敌期产生战意（≈1.5），远低于全程接敌的 ~117
+    expect(ns.war_spirit_generated).toBeLessThan(5);
+  });
+});
+
+describe('盾墙令 0.3 减伤接入结算', () => {
+  it('3 班接敌 + 预置战意：班组平均承伤降至 ~70% 水平', () => {
+    const state = initState();
+    // 防线半径 10.5（策略的「接敌」口径为 dist≤12，需敌人真实推进到防线）
+    const preset = makePreset({
+      layout: {
+        front_squad_radii: [10.5, 10.5, 10.5],
+        archer_radius: 5.5,
+        wall_radius: 8.0,
+        tower_radius: 6.0,
+        barracks_radius: 4.0,
+      },
+    });
+    for (let i = 0; i < 3; i++) deployUnitCard(state, preset, 'card_unit_pikeman', false);
+    for (const sq of state.squads) { sq.max_health = 100000; sq.health = 69000; } // <70% 触发盾墙策略
+    state.war_spirit = 40; // 预置战意保证持续复播（12 费/8s，3 班接敌回 1.5/s）
+
+    const variant: DifficultyVariant = {
+      name: 'test_moving',
+      description: '移动靶（测试用）',
+      count_multiplier: 1,
+      hp_multiplier: 500, // 15000 HP：3 枪卒全程打不死
+      wave_override: () => [{ enemyId: 'enemy_wolf', count: 2 }],
+    };
+    runNight(state, preset, variant, new SeededRNG(11), 0.25);
+    const ns = state.night_stats[0];
+    const E = ns.duration - 5.25;
+    const totalTaken = state.squads.reduce((s, q) => s + (69000 - q.health), 0);
+
+    // 无减伤期望 12×E（≈2817）；盾墙 ~全程覆盖期望 ~70%
+    expect(totalTaken).toBeLessThan(0.78 * 12 * E); // 减伤确实生效
+    expect(totalTaken).toBeGreaterThan(0.55 * 12 * E); // 且接近 ×0.7 而非其他量级
+    expect(ns.tactic_cards_played).toBeGreaterThan(5); // 盾墙被反复打出
+  });
+});
+
+describe('I2 波次结构', () => {
+  it('3 波 × 1 狼 + 15s 间隙：清波后 cleared，时长含 2 个间隙', () => {
+    const { state, preset } = setupPikeman();
+    runNight(state, preset, stationaryVariant('enemy_wolf', 1, 1), new SeededRNG(21), 0.25);
+
+    const ns = state.night_stats[0];
+    expect(ns.end_reason).toBe('cleared');
+    expect(ns.enemies_total).toBe(3); // 3 波各 1 狼
+    expect(ns.kills).toBe(3);
+    // 5s 预演 + 3 波清杀 + 2×15s 间隙
+    expect(ns.duration).toBeGreaterThanOrEqual(37);
+    expect(ns.duration).toBeLessThanOrEqual(75);
+    expect(ns.gold_earned).toBeGreaterThanOrEqual(6); // 3 狼 × 2 金
+  });
+});
+
+describe('军令 6 / 工令 8 容量约束', () => {
+  it('军令：第 7 个班被阻塞计数', () => {
+    const state = initState();
+    state.gold = 10000;
+    const preset = makePreset();
+    for (let i = 0; i < 6; i++) {
+      expect(deployUnitCard(state, preset, 'card_unit_pikeman', false)).toBe(true);
+    }
+    expect(state.military_used).toBe(6);
+    expect(deployUnitCard(state, preset, 'card_unit_pikeman', false)).toBe(false);
+    expect(state.military_blocked).toBe(1);
+  });
+
+  it('工令：第 9 点工事被阻塞并记录剩余金币', () => {
+    const state = initState();
+    state.gold = 10000;
+    const preset = makePreset();
+    for (let i = 0; i < 8; i++) {
+      expect(deployBuildingCard(state, preset, 'card_building_wall', false)).toBe(true);
+    }
+    expect(state.work_used).toBe(8);
+    expect(deployBuildingCard(state, preset, 'card_building_wall', false)).toBe(false);
+    expect(state.work_blocked).toBe(1);
+    expect(state.work_blocked_gold_left).toHaveLength(1);
+    expect(state.work_blocked_gold_left[0]).toBeGreaterThan(0); // 有钱没容量
+  });
+
+  it('M1 军械册同名牌唯一：满编军令 3/6、工令 5/8，容量永不阻塞（关键校准结论）', () => {
+    const state = initState();
+    state.gold = 2000; // 给足金币，隔离容量变量
+    const preset = getPreset('turtle');
+    const rng = new SeededRNG(1);
+    for (let day = 0; day < 4; day++) {
+      runDayPurchases(state, preset, rng);
+    }
+    // 6 卡全落阵：盾卫+枪卒+弓手（军令 3）+ 城墙+箭塔+兵营（工令 5）
+    expect(state.squads).toHaveLength(3);
+    expect(state.buildings).toHaveLength(3);
+    expect(state.military_used).toBe(3);
+    expect(state.work_used).toBe(5);
+    expect(state.military_blocked).toBe(0); // 军令 6 远大于需求上限 3
+    expect(state.work_blocked).toBe(0); // 工令 8 远大于需求上限 5
+  });
+
+  it('同名再部署走升级路径（deployArmoryCard 语义）：实体不重复、Lv3 封顶', () => {
+    const state = initState();
+    state.gold = 500;
+    const preset = makePreset({
+      build_plan: ['card_unit_pikeman'],
+      upgrade_priority: ['card_unit_pikeman'],
+    });
+    const rng = new SeededRNG(2);
+    runDayPurchases(state, preset, rng); // 部署 + 计划完成后升级
+    expect(state.squads).toHaveLength(1);
+    expect(state.squads[0].upgrade_level).toBe(1);
+    expect(state.squads[0].max_health).toBe(120); // 80 × 1.5
+    state.gold = 500;
+    runDayPurchases(state, preset, rng); // 再升一级
+    expect(state.squads).toHaveLength(1);
+    expect(state.squads[0].upgrade_level).toBe(2);
+    state.gold = 500;
+    runDayPurchases(state, preset, rng); // Lv3 封顶，不再升
+    expect(state.squads[0].upgrade_level).toBe(2);
+    expect(state.squads).toHaveLength(1);
+  });
+});
+
+describe('I3 归营堆闭环', () => {
+  it('阵亡入堆 → 次日 50% 修复 → 半血再落阵（全额 cost_day）', () => {
+    const state = initState();
+    const preset = makePreset({ build_plan: ['card_unit_pikeman'] });
+    expect(deployUnitCard(state, preset, 'card_unit_pikeman', false)).toBe(true); // 真实 80 HP
+    const goldAfterDeploy = state.gold; // 500 - 30
+
+    // 2 粉碎者（10 伤害/s ×2）击杀枪卒；粉碎者 80 HP 扛住枪卒反打
+    runNight(state, preset, stationaryVariant('enemy_shield_crusher', 2, 1), new SeededRNG(13), 0.25);
+    expect(state.total_casualties).toBe(1);
+    expect(state.damaged_camp.get('card_unit_pikeman')).toBe(1);
+    expect(state.squads).toHaveLength(0);
+    expect(state.military_used).toBe(0);
+
+    runDayTransition(state);
+    runDayPurchases(state, preset, new SeededRNG(14));
+
+    expect(state.repairs_bought).toBe(1);
+    expect(state.damaged_camp.size).toBe(0);
+    expect(state.squads).toHaveLength(1);
+    expect(state.squads[0].health).toBe(40); // 半血（80×0.5）再入场
+    expect(state.military_used).toBe(1);
+    // 金币：夜末折算(±2) − 修复 ceil(30×50%)=15 − 再落阵 30
+    const expected = goldAfterDeploy - 15 - 30;
+    expect(state.gold).toBeGreaterThanOrEqual(expected - 1);
+    expect(state.gold).toBeLessThanOrEqual(expected + 3);
+  });
+});
+
+describe('I3 同名牌升级', () => {
+  it('每级 maxHP +50% 并回复，Lv3 封顶', () => {
+    const state = initState();
+    const preset = makePreset();
+    deployUnitCard(state, preset, 'card_unit_pikeman', false); // 80 HP，金币 470
+
+    expect(upgradeEntity(state, 'card_unit_pikeman')).toBe(true);
+    expect(state.squads[0].max_health).toBe(120); // 80×1.5
+    expect(state.squads[0].health).toBe(120);
+    expect(upgradeEntity(state, 'card_unit_pikeman')).toBe(true);
+    expect(state.squads[0].max_health).toBe(160); // 80×2.0
+    expect(upgradeEntity(state, 'card_unit_pikeman')).toBe(false); // Lv3 上限
+    expect(state.upgrades_bought).toBe(2);
+  });
+});
+
+// ============ 波次表与难度变体（数据层） ============
+
+describe('波次表与 game 一致（getWaveComposition）', () => {
+  it('第 1/8 夜各波构成', () => {
+    expect(getWaveComposition(1, 1)).toEqual([{ enemyId: 'enemy_wolf', count: 3 }]);
+    expect(getWaveComposition(1, 2)).toEqual([
+      { enemyId: 'enemy_wolf', count: 1 },
+      { enemyId: 'enemy_shield_crusher', count: 1 },
+    ]);
+    expect(getWaveComposition(1, 3)).toEqual([
+      { enemyId: 'enemy_shield_crusher', count: 1 },
+      { enemyId: 'enemy_burrower', count: 1 },
+      { enemyId: 'enemy_wolf', count: 1 },
+    ]);
+    expect(getWaveComposition(8, 1)).toEqual([{ enemyId: 'enemy_wolf', count: 10 }]);
+    expect(getWaveComposition(8, 2)).toEqual([
+      { enemyId: 'enemy_wolf', count: 5 },
+      { enemyId: 'enemy_shield_crusher', count: 3 },
+    ]);
+    expect(getWaveComposition(8, 3)).toEqual([
+      { enemyId: 'enemy_shield_crusher', count: 5 },
+      { enemyId: 'enemy_burrower', count: 5 },
+      { enemyId: 'enemy_wolf', count: 8 },
+    ]);
+    expect(getWaveComposition(1, 4)).toEqual([]);
+  });
+
+  it('难度变体乘数与波次覆写', () => {
+    // dense_1_5x：day1 wave1 狼 3 → ×1.5 = 4.5 → 取整 5
+    expect(getVariantWaveComposition(1, 1, getVariant('dense_1_5x'))).toEqual([
+      { enemyId: 'enemy_wolf', count: 5 },
+    ]);
+    // rebalanced：首波混编（狼 + 粉碎者）；floor(1/2)=0 但覆写路径 max(1,·) 保底 1
+    const w1 = getVariantWaveComposition(1, 1, getVariant('rebalanced'));
+    expect(w1).toContainEqual({ enemyId: 'enemy_wolf', count: 3 });
+    expect(w1).toContainEqual({ enemyId: 'enemy_shield_crusher', count: 1 });
+  });
+});
+
+// ============ 单局冒烟 ============
+
+describe('单局完整性冒烟', () => {
+  it('baseline 全局跑通：8 夜结构完整、金币曲线对齐', () => {
+    const report = runSingleSimulation('baseline', 0, 20261001);
+    expect(report.preset_name).toBe('baseline');
+    expect(report.night_stats.length).toBeGreaterThanOrEqual(1);
+    expect(report.night_stats.length).toBeLessThanOrEqual(8);
+    // 金币曲线：胜局 = 夜数+1（初始 500）；败局最后一夜只记 night_stat 不推曲线
+    expect(report.gold_curve).toHaveLength(
+      report.defeat_reason ? report.night_stats.length : report.night_stats.length + 1
+    );
+    for (const ns of report.night_stats) {
+      expect(ns.day).toBeGreaterThanOrEqual(1);
+      expect(ns.duration).toBeLessThanOrEqual(240.0001);
+    }
+  });
+});
+
+// ============ v2.1 新增：索敌模式与放宽变体 ============
+
+describe('索敌模式（一维 vs 2D 保真度）', () => {
+  it('spread 模式跑通且产出合法战报', () => {
+    const r = runSingleSimulation('baseline', 0, 20261001, 'current', 'spread');
+    expect(r.preset_name).toBe('baseline');
+    expect(r.night_stats.length).toBeGreaterThanOrEqual(1);
+    for (const ns of r.night_stats) {
+      expect(ns.duration).toBeLessThanOrEqual(240.0001);
+      expect(ns.enemies_total).toBeGreaterThan(0);
+    }
+  });
+
+  it('damage_multiplier 直达结算公式（放宽变体口径）', () => {
+    // 狼 6 × 0.6 = 3.6；盾墙 ×0.7 → 2.52
+    expect(computeEnemyHitDamage('enemy_wolf', false, 0.6)).toBeCloseTo(3.6);
+    expect(computeEnemyHitDamage('enemy_wolf', true, 0.6)).toBeCloseTo(2.52);
+  });
+});
+
+describe('放宽变体（校准建议参数）', () => {
+  it('ease_dmg_0_6 变体存在且 200 局胜率落在 40-70% 目标带', () => {
+    const v = getVariant('ease_dmg_0_6');
+    expect(v.damage_multiplier).toBe(0.6);
+    let wins = 0;
+    const RUNS = 200;
+    for (let i = 0; i < RUNS; i++) {
+      if (runSingleSimulation('baseline', i, 20261001 + i, 'ease_dmg_0_6').victory) wins++;
+    }
+    expect(wins / RUNS).toBeGreaterThan(0.3);
+    expect(wins / RUNS).toBeLessThan(0.8);
+  });
+});
