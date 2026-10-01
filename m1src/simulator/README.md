@@ -1,7 +1,7 @@
-# EMBERHOLD 战斗数值模拟器 v2.3
+# EMBERHOLD 战斗数值模拟器 v2.4
 
 《烬堡 EMBERHOLD》无头战斗数值模拟器（Node.js CLI），批量模拟「昼采购 / 夜守城」循环并输出平衡报表。
-v2.1 已对齐 game 源码 **commit 37f798f0**（M1 四批修复后）的战斗模型。
+v2.1 对齐 game M1 四批修复（commit 37f798f0）；v2.4 同步批次二节奏（game v7：预演 3s / 波间 10s / 首夜 6s / 第 2 夜起波间过半刷 2 只落单残兵）。
 
 ## 模型口径（与 game 逐条对齐）
 
@@ -12,7 +12,7 @@ v2.1 已对齐 game 源码 **commit 37f798f0**（M1 四批修复后）的战斗�
 | N2 齐射令 | 伤害 ×1.5 + 射程 ×1.3（按实现建模，卡面「攻速+50%」未消费） | tactics 实现 |
 | I6 战意 | 接敌班每秒 0.5 + 撤退 5s 封锁 | game-state.ts WAR_SPIRIT 常量 |
 | 盾墙令 | 0.3 减伤（仅班组承伤，不影响建筑/主堡） | combat.ts squadDamageReduction |
-| I2 波次 | 每夜 3 波 + 15s 间隙 + 5s 首波预演 + 240s 兜底 | game-state.ts getWaveComposition |
+| I2 波次 | 每夜 3 波 + 10s 间隙（首夜 6s）+ 3s 首波预演 + 240s 兜底；第 2 夜起波间过半刷 2 只落单残兵（狼，未杀并入下波） | game-state.ts / combat.ts 批次二 |
 | 军械册语义 | **每种卡唯一一张；同名再部署 = 升级**（HP +50%/级，Lv3 封顶）；阵亡/摧毁入归营堆，修复 = ⌈cost/2⌉，再落阵半血 | game-state.ts deployArmoryCard / applySquadUpgrade |
 | 容量 | 军令 6 / 工令 8（满编 3/6、5/8 → M1 内永不阻塞） | DESIGN 常量 |
 | 敌人移动 | 接敌 ×0.5 速度向目标、无目标全速向主堡；一维径向：入场半径 13.5 | combat.ts 55-130 行 |
@@ -106,6 +106,33 @@ N3 定案「紧急增援战术牌入池」后（game 侧约一行改动），量
 
 **定价建议（供产品终裁）**：≤8 意才能满足「宽松使用不再显著掉胜率」标准；10 意是全曲线最差点，不可作为定价候选；7 意为最接近「牌从陷阱变可选」的甜点档（基准线以上 +2~+9pp）。game 侧落地仅需改 `cost_night` 一个常量。
 
+## 批次二空窗优化·交叉复核（`scripts/idle-crosscheck.ts`）
+
+口径对齐 game combat.ts checkWaveProgress：**夜内场上敌人存活数为 0 的累计时长 / 夜总时长**（预演期计入）。ease_dmg_0_6（game 已落地 ×0.6：狼 6→4 等）× 1000 局 × 3 preset：
+
+| 夜 | baseline | turtle | aggressive | 验收线 |
+| --- | --- | --- | --- | --- |
+| N1 | 32.7%（PASS） | 45.0%（PASS） | 31.7%（PASS） | ≤50% |
+| N2 | 44.3%（超） | 47.7%（超） | 43.9%（超） | ≤40% |
+| N3 | 42.6%（超） | 44.0%（超） | 42.9%（超） | ≤40% |
+| N4 | 41.2%（超） | 40.4%（超） | 41.3%（超） | ≤40% |
+| N5 | 40.9%（超） | 40.4%（超） | 40.9%（超） | ≤40% |
+| N6–N8 | 34–37%（PASS） | 35–37%（PASS） | 34–37%（PASS） | ≤40% |
+
+**解读**：N2–N5 在模拟器侧超线，不是 game 实现问题——模拟器自动策略接近最优采购（清波极快，~40 只/40s），清得越快波间等待占比越高；game 实测（清波慢）N2 16.9% / N4 1.2% 远低于线。模拟器数字代表**最强玩家的空窗上限**：节奏优化把旧口径 65–88% 压到 31–48%，方向与量级均显著；若在意强玩家体验可再压波间或提前残兵时机。
+
+### ⚠️ 残兵事件难度冲击（重要交叉发现）
+
+残兵计入击杀奖励（狼 2 金 + 1 意）且接敌期产生战意——模拟器口径下每夜 +4 只 ≈ +8 金 / +10 意资源流，在 ×0.6 紧平衡下**非线性放大**：
+
+| 配置 | baseline 胜率 |
+| --- | --- |
+| 无残兵（纯批次二节奏） | 49.3% ≈ 前值 46.2%（节奏本身对难度无实质影响） |
+| 残兵 1 只/波间 | 63.0% |
+| 残兵 2 只/波间（game v7 现状） | **93.3%**（turtle 97.7% / aggressive 92.3%） |
+
+game 侧残兵同样计奖励 → 难度同样会下降（幅度取决于玩家操作，方向确定）。若要保 40–70% 难度带，选项：残兵不计击杀奖励/战意（纯填充）· 减为 1 只 · 奖励减半。测试已锁定该事实（`批次二·落单残兵显著抬升胜率`），game 侧调整后需同步更新。
+
 ## Quick Start
 
 ```bash
@@ -129,6 +156,9 @@ npx tsx scripts/reinforce-pricing.ts
 # 定价价格曲线扫描（6–16 意全档）
 npx tsx scripts/reinforce-price-sweep.ts
 
+# 批次二空窗交叉复核（逐夜空窗占比 × 3 preset）
+npx tsx scripts/idle-crosscheck.ts
+
 # 单测（22 个，含口径锁定）
 npm test
 ```
@@ -150,6 +180,7 @@ scripts/reinforce-impact.ts       # 增援入池影响（N3 前瞻）
 scripts/reinforce-pricing.ts      # 定价三方案验证（主实验）
 scripts/reinforce-a10-diagnosis.ts / -ablation.ts / -price-sweep.ts  # A10 非单调异常定位
 scripts/reinforce-cross-seed.ts   # 关键定价档跨种子复验
-tests/engine.test.ts   # 30 个单测（口径锁定 + 回归 + 定价方案接线）
+scripts/idle-crosscheck.ts        # 批次二空窗交叉复核（game 口径）
+tests/engine.test.ts   # 31 个单测（口径锁定 + 回归 + 定价方案接线）
 reports/               # 输出报表 JSON
 ```
