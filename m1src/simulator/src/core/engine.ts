@@ -445,8 +445,8 @@ interface NightOptions extends ReinforceExperimentOptions {
   reinforceInDeckOnly?: boolean;
   /** 诊断用：收紧增援打出条件——仅「前排全残/无前排」真正崩线才打。 */
   reinforceSmart?: boolean;
-  /** 诊断用：关闭落单残兵（校准带纯节奏口径锁定）。 */
-  stragglerOff?: boolean;
+  /** 残兵奖励口径旋钮（对齐 game stragglerMode 五档，default=game v7 现状）。 */
+  stragglerMode?: 'default' | 'no_reward' | 'single' | 'half_reward' | 'off';
 }
 
 /** 战术牌策略（对 game 玩家决策的抽象，含反应延迟制造局间方差）。 */
@@ -594,6 +594,22 @@ function runNight(
   // 当夜统计
   let idleSeconds = 0;
   let emptyFieldSeconds = 0;
+  // 击杀奖励统一结算（批次三·残兵口径旋钮：no_reward=残兵零奖励 / half_reward=残兵减半，波次敌人不受影响）
+  const settleKill = (enemy: SimEnemy): void => {
+    const ed = getEnemy(enemy.enemy_id);
+    let rg = ed.reward_gold, rs = ed.reward_war_spirit;
+    if (enemy.is_straggler) {
+      const mode = options?.stragglerMode ?? 'default';
+      if (mode === 'no_reward') { rg = 0; rs = 0; }
+      else if (mode === 'half_reward') { rg = ed.reward_gold / 2; rs = ed.reward_war_spirit / 2; }
+    }
+    state.gold += rg;
+    goldEarned += rg;
+    state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + rs);
+    warSpiritGen += rs;
+    state.total_kills++;
+    kills++;
+  };
   let engagedSeconds = 0;
   let kills = 0;
   let squadLosses = 0;
@@ -618,29 +634,34 @@ function runNight(
     // ---- 波次状态机（I2） ----
     if (!rt.wave_active) {
       rt.gap_timer -= dt;
-      // 批次二·落单残兵：第 2 夜起每个波间过半时确定性刷 2 只狼（基础 HP，不带变体 hpMult——game 无变体机制），
+      // 批次二·落单残兵：第 2 夜起每个波间过半时确定性刷狼（基础 HP，不带变体 hpMult——game 无变体机制），
       // 填充空窗后半段；不改波次状态机，未杀残兵并入下一波（本就存于 rt.enemies）。
+      // 批次三·口径旋钮（对齐 game stragglerMode）：single=1 只 / off=不刷；奖励口径在 settleKill 内结算。
       if (
         !rt.straggler_spawned &&
-        !options?.stragglerOff &&
         state.day >= STRAGGLER_START_DAY &&
         rt.wave_number >= 1 &&
         rt.gap_total > 0 &&
         rt.gap_timer <= rt.gap_total * (1 - STRAGGLER_GAP_FRACTION)
       ) {
-        rt.straggler_spawned = true;
-        const sd = getEnemy('enemy_wolf');
-        for (let i = 0; i < STRAGGLER_COUNT_PER_GAP; i++) {
-          rt.enemies.push({
-            id: `e_${rt.enemies.length}`,
-            enemy_id: 'enemy_wolf',
-            health: sd.max_health,
-            max_health: sd.max_health,
-            dist: MAP_SPAWN_RADIUS * rng.range(0.95, 1.1),
-            speed_factor: rng.range(0.55, 1.0),
-            attack_cooldown: 0,
-          });
-          spawnedTotal += 1;
+        const mode = options?.stragglerMode ?? 'default';
+        const stragglerCount = mode === 'single' ? 1 : mode === 'off' ? 0 : STRAGGLER_COUNT_PER_GAP;
+        if (stragglerCount > 0) {
+          rt.straggler_spawned = true;
+          const sd = getEnemy('enemy_wolf');
+          for (let i = 0; i < stragglerCount; i++) {
+            rt.enemies.push({
+              id: `e_${rt.enemies.length}`,
+              enemy_id: 'enemy_wolf',
+              health: sd.max_health,
+              max_health: sd.max_health,
+              dist: MAP_SPAWN_RADIUS * rng.range(0.95, 1.1),
+              speed_factor: rng.range(0.55, 1.0),
+              attack_cooldown: 0,
+              is_straggler: true,
+            });
+            spawnedTotal += 1;
+          }
         }
       }
       if (rt.gap_timer <= 0) spawnWithCount(rt.wave_number + 1);
@@ -783,13 +804,7 @@ function runNight(
         // 冷却补偿：保留本拍提前量，长程攻击节奏精确为 attack_speed 秒/次（⌈t/attack_speed⌉ 口径）
         sq.attack_cooldown += unit.attack_speed; // game: attackCooldown = attack_speed（秒）
         if (target.health <= 0) {
-          const ed = getEnemy(target.enemy_id);
-          state.gold += ed.reward_gold;
-          goldEarned += ed.reward_gold;
-          state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + ed.reward_war_spirit);
-          warSpiritGen += ed.reward_war_spirit;
-          state.total_kills++;
-          kills++;
+          settleKill(target);
           sq.kills++;
           rt.enemies.splice(rt.enemies.indexOf(target), 1);
         }
@@ -835,13 +850,7 @@ function runNight(
           target.health -= bd.attack_damage; // 事件式固定伤害
           b.attack_cooldown += bd.attack_speed;
           if (target.health <= 0) {
-            const ed = getEnemy(target.enemy_id);
-            state.gold += ed.reward_gold;
-            goldEarned += ed.reward_gold;
-            state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + ed.reward_war_spirit);
-            warSpiritGen += ed.reward_war_spirit;
-            state.total_kills++;
-            kills++;
+            settleKill(target);
             rt.enemies.splice(rt.enemies.indexOf(target), 1);
           }
         }
@@ -865,13 +874,7 @@ function runNight(
         if (Math.abs(en.dist - rt.fire_zone.radius) <= 3) {
           en.health -= 15 * dt;
           if (en.health <= 0) {
-            const ed = getEnemy(en.enemy_id);
-            state.gold += ed.reward_gold;
-            goldEarned += ed.reward_gold;
-            state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + ed.reward_war_spirit);
-            warSpiritGen += ed.reward_war_spirit;
-            state.total_kills++;
-            kills++;
+            settleKill(en);
             rt.enemies.splice(i, 1);
           }
         }
