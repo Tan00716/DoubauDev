@@ -346,7 +346,7 @@ export const TACTIC_CARDS: CardData[] = [
     layer: 'tactic',
     category: 'tactic',
     cost_day: 0,
-    cost_night: 15,
+    cost_night: 7, // 定价终裁 15→7（出处：设计主文档 rev32 + 开发里程碑验收计划 rev8；模拟器三方案验证后产品终裁）
     effect_description: '立即在指定位置召唤一支盾卫班（夜末消散）',
     target_type: 'terrain',
     duration: 0,
