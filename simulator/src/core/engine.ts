@@ -413,8 +413,25 @@ function drawTactic(rt: NightRuntime, rng: SeededRNG, count: number): void {
   }
 }
 
+/** 夜间运行选项（实验开关，默认全关 = 与 game 当前发布口径一致）。 */
+interface NightOptions {
+  /** 紧急增援牌入池（N3 定案「近似牌入池」）：加入初始牌库 + 策略可打出。 */
+  includeReinforce?: boolean;
+  /** 诊断用：牌入池占手位但策略不打出（隔离牌库稀释效应）。 */
+  reinforceInDeckOnly?: boolean;
+  /** 诊断用：收紧增援打出条件——仅「前排全残/无前排」真正崩线时才打。 */
+  reinforceSmart?: boolean;
+}
+
 /** 战术牌策略（对 game 玩家决策的抽象，含反应延迟制造局间方差）。 */
-function runTacticPolicy(rt: NightRuntime, state: RunState, _preset: PresetConfig, rng: SeededRNG, dt: number): number {
+function runTacticPolicy(
+  rt: NightRuntime,
+  state: RunState,
+  preset: PresetConfig,
+  rng: SeededRNG,
+  dt: number,
+  options?: NightOptions
+): number {
   let played = 0;
   for (const id of TACTIC_IDS) {
     rt.tactic_cooldowns[id] = (rt.tactic_cooldowns[id] ?? 0) - dt;
@@ -426,7 +443,7 @@ function runTacticPolicy(rt: NightRuntime, state: RunState, _preset: PresetConfi
   const engagedEnemies = rt.enemies.filter(e => e.dist <= 12).length;
   const hurtSquad = fieldSquads.some(s => s.health / s.max_health < 0.7);
 
-  const tryPlay = (cardId: string, condition: boolean): void => {
+  const tryPlay = (cardId: string, condition: boolean, effect?: () => void): void => {
     if (!condition) return;
     if (rt.tactic_cooldowns[cardId] > 0) return;
     const idx = rt.hand.indexOf(cardId);
@@ -444,11 +461,15 @@ function runTacticPolicy(rt: NightRuntime, state: RunState, _preset: PresetConfi
     // game：打出手牌后立即补抽 1（playTacticCard → drawTacticCards(1)）
     drawTactic(rt, rng, 1);
     // 效果
-    if (cardId === 'card_tactic_shield_wall') rt.shield_wall_timer = card.duration;
-    if (cardId === 'card_tactic_volley') rt.volley_timer = card.duration;
-    if (cardId === 'card_tactic_fire_oil') {
-      const frontRadius = frontSquads.length > 0 ? Math.max(...frontSquads.map(s => s.radius)) : 8;
-      rt.fire_zone = { radius: frontRadius, remaining: card.duration };
+    if (effect) {
+      effect();
+    } else {
+      if (cardId === 'card_tactic_shield_wall') rt.shield_wall_timer = card.duration;
+      if (cardId === 'card_tactic_volley') rt.volley_timer = card.duration;
+      if (cardId === 'card_tactic_fire_oil') {
+        const frontRadius = frontSquads.length > 0 ? Math.max(...frontSquads.map(s => s.radius)) : 8;
+        rt.fire_zone = { radius: frontRadius, remaining: card.duration };
+      }
     }
     // 反应延迟：打出后该卡 6±2 秒内不再考虑
     rt.tactic_cooldowns[cardId] = rng.range(4, 8);
@@ -463,6 +484,41 @@ function runTacticPolicy(rt: NightRuntime, state: RunState, _preset: PresetConfi
   tryPlay('card_tactic_volley', !!archer && wolvesNear >= 3);
   // 集结号：M1 无战斗效果，不打（保留在手牌占位，与 game 行为一致）
 
+  // 紧急增援（N3 定案「近似牌入池」口径，实验开关）：
+  // 防线告急（前排 <40% 血或防线有缺口）+ 有敌接近时召唤应急盾卫（满血、夜末消散、军令+1）。
+  // N1 修复后口径：容量满时出牌被拒（战意/手牌不变）→ 策略层直接预检不打，零消耗。
+  if (options?.includeReinforce || options?.reinforceSmart) {
+    const frontCrisis = frontSquads.some(s => s.health / s.max_health < 0.4);
+    const gapOnLine = state.squads.some(s => !s.on_field && !s.is_emergency);
+    // smart 口径：仅「前排全残或已无前排」才视为真正崩线
+    const collapse = frontSquads.length === 0 ||
+      frontSquads.every(s => s.health / s.max_health < 0.4);
+    const trigger = options?.reinforceSmart ? collapse : (frontCrisis || gapOnLine);
+    tryPlay(
+      'card_tactic_reinforce',
+      engagedEnemies >= 1 && trigger &&
+        state.military_used + 1 <= DESIGN_MILITARY_CAPACITY,
+      () => {
+        state.squads.push({
+          id: `sq_emg_${state.squads.length}`,
+          unit_id: 'unit_shieldbearer',
+          health: 120,
+          max_health: 120,
+          radius: preset.layout.front_squad_radii[0],
+          upgrade_level: 0,
+          on_field: true,
+          is_emergency: true,
+          attack_cooldown: 0,
+          war_spirit_block_timer: 0,
+          damage_dealt: 0,
+          attacks: 0,
+          kills: 0,
+        });
+        state.military_used += 1;
+      }
+    );
+  }
+
   return played;
 }
 
@@ -472,7 +528,8 @@ function runNight(
   variant: DifficultyVariant | null,
   rng: SeededRNG,
   dtOverride?: number,
-  targeting: 'nearest' | 'spread' = 'nearest'
+  targeting: 'nearest' | 'spread' = 'nearest',
+  options?: NightOptions
 ): void {
   const hpMult = variant?.hp_multiplier ?? 1;
   const speedMult = variant?.speed_multiplier ?? 1;
@@ -483,7 +540,9 @@ function runNight(
     gap_timer: WAVE_PREVIEW_LEAD_SECONDS,
     enemies: [],
     hand: [],
-    deck: rng.shuffle([...INITIAL_TACTIC_DECK]),
+    deck: rng.shuffle(options?.includeReinforce || options?.reinforceInDeckOnly
+      ? [...INITIAL_TACTIC_DECK, 'card_tactic_reinforce']
+      : [...INITIAL_TACTIC_DECK]),
     discard: [],
     first_tactic_free: true,
     draws_done: 0,
@@ -666,8 +725,8 @@ function runNight(
         }
       }
 
-      // 撤退策略（血线以下撤退保卡：离场、5s 战意封锁）
-      if (sq.health / sq.max_health < preset.retreat_threshold) {
+      // 撤退策略（血线以下撤退保卡：离场、5s 战意封锁；应急班不撤——夜末消散机制本身就是其生命周期）
+      if (!sq.is_emergency && sq.health / sq.max_health < preset.retreat_threshold) {
         sq.on_field = false;
         sq.war_spirit_block_timer = RETREAT_WAR_SPIRIT_BLOCK_SECONDS;
         squadRetreats++;
@@ -755,7 +814,7 @@ function runNight(
     if (rt.volley_timer > 0) rt.volley_timer -= dt;
 
     // ---- 战术策略 ----
-    tacticsPlayed += runTacticPolicy(rt, state, preset, rng, dt);
+    tacticsPlayed += runTacticPolicy(rt, state, preset, rng, dt, options);
 
     // ---- 主堡沦陷判定 ----
     if (state.keep_health <= 0) {
@@ -809,9 +868,12 @@ function runNight(
     goldEarned += bonus;
     state.war_spirit = 0;
   }
-  // 撤退班次日回归（保留当前血量，昼间再自愈 20%）；应急增援夜末消散
+  // 撤退班次日回归（保留当前血量，昼间再自愈 20%）；应急增援夜末消散（释放军令，对齐 game removeSquad）
   for (const sq of state.squads) {
     if (!sq.on_field && !sq.is_emergency) sq.on_field = true;
+  }
+  for (const sq of state.squads) {
+    if (sq.is_emergency) state.military_used -= getUnit(sq.unit_id).military_cost;
   }
   state.squads = state.squads.filter(s => !s.is_emergency);
 
@@ -851,7 +913,8 @@ export function runSingleSimulation(
   runId: number,
   seed: number,
   variantName: string = 'current',
-  targeting: 'nearest' | 'spread' = 'nearest'
+  targeting: 'nearest' | 'spread' = 'nearest',
+  options?: { includeReinforce?: boolean }
 ): SingleRunReport {
   const preset = getPreset(presetName);
   const variant = variantName === 'current' ? null : getVariant(variantName);
@@ -862,7 +925,7 @@ export function runSingleSimulation(
   runDayPurchases(state, preset, rng);
 
   while (!state.is_game_over && state.day <= VICTORY_DAYS) {
-    runNight(state, preset, variant, rng, undefined, targeting);
+    runNight(state, preset, variant, rng, undefined, targeting, options);
     if (state.is_game_over) break;
 
     if (state.day >= VICTORY_DAYS) {
@@ -912,5 +975,6 @@ export const _internal = {
   deployBuildingCard,
   upgradeEntity,
   radiusForSquad,
+  runTacticPolicy,
   SeededRNG,
 };
