@@ -33,12 +33,20 @@ export class SpatialGrid<T extends GriddedEntity> {
   }
 
   insert(item: T): void {
-    const cx = Math.floor((item.position.x - this.originX) / this.cellSize);
-    const cz = Math.floor((item.position.z - this.originZ) / this.cellSize);
+    // 建议级修复（质检批次一复核）：insert 允许负格 / 越界格索引，而 queryNearest 将扫描范围
+    // 钳制在 [0, dim-1]——两侧不对称。若实体短暂越出地图边界（位移 overshoot、击退等），
+    // 会被写入永远查不到的格，表现为「实体存在却寻敌 miss」。此处同样钳制：
+    // 越界实体吸附到边缘格，保证 insert / queryNearest 格索引空间一致。
+    const cx = this.clampIndex(Math.floor((item.position.x - this.originX) / this.cellSize));
+    const cz = this.clampIndex(Math.floor((item.position.z - this.originZ) / this.cellSize));
     const key = this.cellKey(cx, cz);
     const arr = this.cells.get(key);
     if (arr) arr.push(item);
     else this.cells.set(key, [item]);
+  }
+
+  private clampIndex(idx: number): number {
+    return Math.min(this.dim - 1, Math.max(0, idx));
   }
 
   /** 实体被移出战场时同步从网格摘除，保证查询结果与实时数组一致。 */
