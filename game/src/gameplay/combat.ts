@@ -1,9 +1,12 @@
-import { gameState, type SquadEntity, type EnemyEntity, type BuildingEntity, type Position } from './game-state';
+import { gameState, type SquadEntity, type EnemyEntity, type BuildingEntity, type Position, getWaveComposition, TOTAL_WAVES, WAVE_GAP_SECONDS, WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC } from './game-state';
 import { getUnitData, getBuildingData, getEnemyData } from '../content/data';
 import { eventBus } from '../core/event-bus';
 
 const MAP_SIZE = 30;
 const MAIN_KEEP_POS: Position = { x: 0, z: 0 };
+
+/** 夜间每 8 秒补抽 1 张战术牌（设计：卡牌系统·战术手牌）。 */
+const NIGHT_TACTIC_DRAW_INTERVAL = 8;
 
 export function updateCombat(dt: number): void {
   if (gameState.phase !== 'night') return;
@@ -26,6 +29,7 @@ function updateEffects(dt: number): void {
         const dx = en.position.x - x;
         const dz = en.position.z - z;
         if (dx * dx + dz * dz < radius * radius) {
+          // 火圈为持续伤害（DPS 模型），* dt 是正确语义，保留
           en.health -= damage * dt;
           en.isBurning = true;
           en.burnDamage = damage;
@@ -41,12 +45,15 @@ function updateEffects(dt: number): void {
 }
 
 function updateEnemies(dt: number): void {
+  // 盾墙令减伤（原有 activeEffects 中存在但从未被消费，B1 重构时激活）
+  const squadDamageReduction = hasActiveEffect('shield_wall') ? 0.3 : 0;
+
   for (let i = gameState.enemies.length - 1; i >= 0; i--) {
     const en = gameState.enemies[i];
     const data = getEnemyData(en.enemyId);
     if (!data) continue;
 
-    // Burn damage
+    // Burn damage（DPS 模型，保留 * dt）
     if (en.isBurning) {
       en.burnTimer -= dt;
       if (en.burnTimer <= 0) {
@@ -77,22 +84,22 @@ function updateEnemies(dt: number): void {
     }
 
     // Find target: prioritize squads, then buildings, then main keep
-    let targetSquad = findNearestSquad(en.position, 1.5);
-    let targetBuilding = findNearestBuilding(en.position, 1.5);
+    const targetSquad = findNearestSquad(en.position, 1.5);
+    const targetBuilding = findNearestBuilding(en.position, 1.5);
 
     if (targetSquad) {
-      // Attack squad
+      // Attack squad —— B1：事件式固定伤害（原 * dt * 2 帧率依赖已移除）
       if (en.attackCooldown <= 0) {
-        targetSquad.health -= data.damage * dt * 2;
+        targetSquad.health -= data.damage * (1 - squadDamageReduction);
         en.attackCooldown = 1.0;
         eventBus.emit('entity-damaged', { id: targetSquad.id, health: targetSquad.health });
       }
       // Move toward squad
       moveToward(en.position, targetSquad.position, data.move_speed * en.speedModifier * dt * 0.5);
     } else if (targetBuilding) {
-      // Attack building
+      // Attack building —— B1：事件式固定伤害
       if (en.attackCooldown <= 0) {
-        targetBuilding.health -= data.damage * dt * 2;
+        targetBuilding.health -= data.damage;
         en.attackCooldown = 1.0;
         eventBus.emit('entity-damaged', { id: targetBuilding.id, health: targetBuilding.health });
       }
@@ -102,8 +109,9 @@ function updateEnemies(dt: number): void {
       // Move toward main keep
       const distToKeep = distance(en.position, MAIN_KEEP_POS);
       if (distToKeep < 2.0) {
+        // Attack main keep —— B1：事件式固定伤害
         if (en.attackCooldown <= 0) {
-          gameState.mainKeepHealth -= data.damage * dt * 2;
+          gameState.mainKeepHealth -= data.damage;
           en.attackCooldown = 1.0;
           eventBus.emit('entity-damaged', { id: 'main_keep', health: gameState.mainKeepHealth });
         }
@@ -120,21 +128,29 @@ function updateEnemies(dt: number): void {
 }
 
 function updateSquads(dt: number): void {
+  // I6：本帧接敌班战意产出汇总，一次性入账（避免逐班 emit）
+  let frameWarSpirit = 0;
+
   for (let i = gameState.squads.length - 1; i >= 0; i--) {
     const sq = gameState.squads[i];
     const data = getUnitData(sq.unitId);
     if (!data) continue;
 
-    // Death check
+    // Death check —— 阵亡入受损归营堆（I3），由 game-state 统一结算
     if (sq.health <= 0) {
-      gameState.removeSquad(sq.id);
-      gameState.squadsLostThisNight++;
+      gameState.squadDestroyed(sq);
       continue;
     }
 
     // Attack cooldown
     if (sq.attackCooldown > 0) {
       sq.attackCooldown -= dt;
+    }
+
+    // I6：撤退战意封锁计时衰减
+    if (sq.warSpiritBlockTimer > 0) {
+      sq.warSpiritBlockTimer -= dt;
+      if (sq.warSpiritBlockTimer < 0) sq.warSpiritBlockTimer = 0;
     }
 
     // Handle commands
@@ -157,43 +173,55 @@ function updateSquads(dt: number): void {
         sq.position.x += (dx / len) * data.move_speed * dt;
         sq.position.z += (dz / len) * data.move_speed * dt;
       }
-      // Retreat only produces no war spirit for 5s (simplified: just move away)
     }
 
     // Auto-attack nearest enemy in range
     const attackRange = data.attack_range * (sq.unitId === 'unit_archer' && hasActiveEffect('volley') ? 1.3 : 1);
     const target = findNearestEnemyInRange(sq.position, attackRange);
 
+    // I6：接敌班每秒 0.5 战意（原「每次攻击事件 +0.5」移除）。
+    // 接敌 = 射程内有敌、非撤退、且不在 5 秒封锁期。
+    const engaged = !!target && sq.command !== 'retreat' && sq.warSpiritBlockTimer <= 0;
+    if (engaged) {
+      const gain = WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC * dt;
+      sq.warSpiritAccum += gain;
+      frameWarSpirit += gain;
+    }
+
     if (target && sq.attackCooldown <= 0 && sq.command !== 'retreat') {
-      const dmg = data.attack_damage * (hasActiveEffect('volley') && sq.unitId === 'unit_archer' ? 1.5 : 1);
+      let dmg = data.attack_damage * (hasActiveEffect('volley') && sq.unitId === 'unit_archer' ? 1.5 : 1);
+
+      // B2：枪卒反冲锋加成并入 attackCooldown 门控分支，与主攻击同拍结算。
+      // 对移速 > 3.0 的冲锋型敌人（狼群 3.5），单次攻击 = 基础伤害 + 50% 加成。
+      if (sq.unitId === 'unit_pikeman') {
+        const enemyData = getEnemyData(target.enemyId);
+        if (enemyData && enemyData.move_speed > 3.0) {
+          dmg += data.attack_damage * 0.5;
+        }
+      }
+
       target.health -= dmg;
       sq.attackCooldown = data.attack_speed;
 
-      // Produce war spirit on contact
-      gameState.addWarSpirit(0.5);
-
       eventBus.emit('entity-damaged', { id: target.id, health: target.health });
     }
+  }
 
-    // Pikeman anti-charge bonus
-    if (sq.unitId === 'unit_pikeman' && target) {
-      const enemyData = getEnemyData(target.enemyId);
-      if (enemyData && enemyData.move_speed > 3.0) {
-        target.health -= data.attack_damage * 0.5; // Bonus damage
-      }
-    }
+  // I6：本帧接敌战意一次性入账
+  if (frameWarSpirit > 0) {
+    gameState.addWarSpirit(frameWarSpirit);
   }
 }
 
 function updateBuildings(dt: number): void {
-  for (const b of gameState.buildings) {
+  for (let i = gameState.buildings.length - 1; i >= 0; i--) {
+    const b = gameState.buildings[i];
     const data = getBuildingData(b.buildingId);
     if (!data) continue;
 
-    // Building destruction check
+    // Building destruction check —— 摧毁入受损归营堆（I3）
     if (b.health <= 0) {
-      eventBus.emit('entity-destroyed', { id: b.id });
-      gameState.removeBuilding(b.id);
+      gameState.buildingDestroyed(b);
       continue;
     }
 
@@ -201,7 +229,7 @@ function updateBuildings(dt: number): void {
       b.attackCooldown -= dt;
     }
 
-    // Arrow tower auto-attack
+    // Arrow tower auto-attack（事件式固定伤害，原实现即正确）
     if (b.buildingId === 'building_arrow_tower' && b.attackCooldown <= 0) {
       const target = findNearestEnemyInRange(b.position, data.attack_range);
       if (target) {
@@ -211,7 +239,7 @@ function updateBuildings(dt: number): void {
       }
     }
 
-    // Barracks: heal nearby squads
+    // Barracks: heal nearby squads（DPS 模型，保留 * dt）
     if (b.buildingId === 'building_barracks') {
       for (const sq of gameState.squads) {
         if (distance(sq.position, b.position) < 4.0) {
@@ -222,36 +250,60 @@ function updateBuildings(dt: number): void {
   }
 }
 
+/**
+ * I2：显式波次状态机（替代原概率刷怪 `Math.random() < dt/spawnRate`）。
+ * 节奏：入夜 5 秒威胁预演 → 波 1 → 清波 → 15 秒间隙（弃 2 抽 2 + 下波预演）→ 波 2 → … → 波 3 清空或 240s 夜时到 → 结夜。
+ */
 function checkWaveProgress(dt: number): void {
   gameState.nightTimer += dt;
 
-  // Spawn enemies throughout the night
-  const spawnRate = gameState.dayCount <= 1 ? 2.0 : gameState.dayCount <= 2 ? 1.5 : 1.0;
-  if (gameState.waveActive && Math.random() < dt / spawnRate) {
-    spawnRandomEnemy();
+  // 夜间每 8 秒补抽 1 张战术牌
+  if (gameState.nightTimer - gameState.lastTacticDrawAt >= NIGHT_TACTIC_DRAW_INTERVAL) {
+    gameState.lastTacticDrawAt = gameState.nightTimer;
+    gameState.drawTacticCards(1);
   }
 
-  // Night ends after duration
+  if (!gameState.waveActive) {
+    // 波间/首波倒计时
+    gameState.gapTimer -= dt;
+    if (gameState.gapTimer <= 0) {
+      spawnWave(gameState.waveNumber + 1);
+    }
+  } else if (gameState.enemies.length === 0) {
+    // 当前波已清空
+    if (gameState.waveNumber >= TOTAL_WAVES) {
+      gameState.endNight();
+      return;
+    }
+    gameState.waveActive = false;
+    gameState.gapTimer = WAVE_GAP_SECONDS;
+    gameState.discardAndDrawAtGap();
+    gameState.setWavePreview(gameState.waveNumber + 1, gameState.gapTimer);
+  }
+
+  // 夜时长兜底（240s，含波次间隙）
   if (gameState.nightTimer >= gameState.nightDuration) {
     gameState.endNight();
   }
 }
 
-function spawnRandomEnemy(): void {
-  const enemyTypes = ['enemy_wolf', 'enemy_shield_crusher', 'enemy_burrower'];
-  // More enemy variety as days progress
-  const available = enemyTypes.slice(0, Math.min(enemyTypes.length, gameState.dayCount + 1));
-  const type = available[Math.floor(Math.random() * available.length)];
+/** 按显式波次表生成一波敌人（I2）：构成确定，无随机。 */
+function spawnWave(waveNumber: number): void {
+  gameState.waveNumber = waveNumber;
+  gameState.waveActive = true;
+  gameState.clearWavePreview();
 
-  // Spawn at edge of map
-  const angle = Math.random() * Math.PI * 2;
-  const radius = MAP_SIZE * 0.45;
-  const pos = {
-    x: Math.cos(angle) * radius,
-    z: Math.sin(angle) * radius,
-  };
-
-  gameState.spawnEnemy(type, pos);
+  const entries = getWaveComposition(gameState.dayCount, waveNumber);
+  for (const entry of entries) {
+    for (let i = 0; i < entry.count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = MAP_SIZE * 0.45;
+      gameState.spawnEnemy(entry.enemyId, {
+        x: Math.cos(angle) * radius,
+        z: Math.sin(angle) * radius,
+      });
+    }
+  }
 }
 
 function findNearestSquad(pos: Position, maxRange: number): SquadEntity | null {
