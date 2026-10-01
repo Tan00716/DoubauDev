@@ -117,7 +117,7 @@ describe('B1 敌方事件式固定伤害 + 冷却门控', () => {
     const ns = state.night_stats[0];
     expect(ns.end_reason).toBe('timeout_240s'); // 固定靶打不死 → 240s 兜底
     expect(ns.duration).toBe(240);
-    const E = ns.duration - 5.25; // 5s 首波预演后接敌
+    const E = ns.duration - 3.25; // 3s 首波预演（批次二）后接敌
 
     const pikeman = state.squads[0];
     const taken = 100000 - pikeman.health;
@@ -211,7 +211,7 @@ describe('盾墙令 0.3 减伤接入结算', () => {
 });
 
 describe('I2 波次结构', () => {
-  it('3 波 × 1 狼 + 15s 间隙：清波后 cleared，时长含 2 个间隙', () => {
+  it('3 波 × 1 狼 + 首夜 6s 间隙（批次二）：清波后 cleared，时长含 2 个间隙', () => {
     const { state, preset } = setupPikeman();
     runNight(state, preset, stationaryVariant('enemy_wolf', 1, 1), new SeededRNG(21), 0.25);
 
@@ -219,8 +219,8 @@ describe('I2 波次结构', () => {
     expect(ns.end_reason).toBe('cleared');
     expect(ns.enemies_total).toBe(3); // 3 波各 1 狼
     expect(ns.kills).toBe(3);
-    // 5s 预演 + 3 波清杀 + 2×15s 间隙
-    expect(ns.duration).toBeGreaterThanOrEqual(37);
+    // 3s 预演（批次二）+ 3 波清杀 + 2×6s 首夜间隙
+    expect(ns.duration).toBeGreaterThanOrEqual(15);
     expect(ns.duration).toBeLessThanOrEqual(75);
     expect(ns.gold_earned).toBeGreaterThanOrEqual(6); // 3 狼 × 2 金
   });
@@ -417,16 +417,26 @@ describe('索敌模式（一维 vs 2D 保真度）', () => {
 });
 
 describe('放宽变体（校准建议参数）', () => {
-  it('ease_dmg_0_6 变体存在且 200 局胜率落在 40-70% 目标带', () => {
+  it('ease_dmg_0_6 + 残兵关（纯节奏口径）200 局胜率落在 40-70% 目标带', () => {
     const v = getVariant('ease_dmg_0_6');
     expect(v.damage_multiplier).toBe(0.6);
     let wins = 0;
     const RUNS = 200;
     for (let i = 0; i < RUNS; i++) {
-      if (runSingleSimulation('baseline', i, 20261001 + i, 'ease_dmg_0_6').victory) wins++;
+      if (runSingleSimulation('baseline', i, 20261001 + i, 'ease_dmg_0_6', 'nearest', { stragglerOff: true }).victory) wins++;
     }
     expect(wins / RUNS).toBeGreaterThan(0.3);
     expect(wins / RUNS).toBeLessThan(0.8);
+  });
+
+  it('批次二·落单残兵（game v7 完整口径）显著抬升胜率——锁定难度冲击事实', () => {
+    // 残兵 +8金/+10意/夜 资源流在 ×0.6 紧平衡下非线性放大：无残兵 ~49% → 2只/波间 >90%
+    let wins = 0;
+    const RUNS = 200;
+    for (let i = 0; i < RUNS; i++) {
+      if (runSingleSimulation('baseline', i, 20261001 + i, 'ease_dmg_0_6').victory) wins++;
+    }
+    expect(wins / RUNS).toBeGreaterThan(0.8);
   });
 });
 
