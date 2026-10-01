@@ -174,6 +174,7 @@ export interface SimEnemy {
   dist: number; // 距主堡的径向距离
   speed_factor: number; // 入场角度差异的抽象（到达时间错峰）
   attack_cooldown: number;
+  is_straggler?: boolean; // 落单残兵标记（奖励口径旋钮用，波次敌人恒 false）
 }
 
 // ============ 报告类型 ============
