@@ -167,7 +167,7 @@ export const ENEMIES: EnemyData[] = [
     enemy_id: 'enemy_wolf',
     enemy_name: '狼群',
     max_health: 30,
-    damage: 6,
+    damage: 4, // M1 校准：6→4（×0.6 取整）出处：设计文档 rev30 附录「M1 数值校准基准」
     attack_range: 1.0,
     move_speed: 3.5,
     color: '#8e44ad',
@@ -179,7 +179,7 @@ export const ENEMIES: EnemyData[] = [
     enemy_id: 'enemy_shield_crusher',
     enemy_name: '盾卫',
     max_health: 80,
-    damage: 10,
+    damage: 6, // M1 校准：10→6（×0.6 取整）出处：设计文档 rev30 附录「M1 数值校准基准」
     attack_range: 1.2,
     move_speed: 2.0,
     color: '#2c3e50',
@@ -191,7 +191,7 @@ export const ENEMIES: EnemyData[] = [
     enemy_id: 'enemy_burrower',
     enemy_name: '掘地者',
     max_health: 50,
-    damage: 8,
+    damage: 5, // M1 校准：8→5（×0.6 取整）出处：设计文档 rev30 附录「M1 数值校准基准」
     attack_range: 1.0,
     move_speed: 2.5,
     color: '#27ae60',
@@ -333,7 +333,7 @@ export const TACTIC_CARDS: CardData[] = [
     category: 'tactic',
     cost_day: 0,
     cost_night: 8,
-    effect_description: '所有弓手班攻速+50%，持续6秒',
+    effect_description: '所有弓手班伤害+50%、射程+30%，持续6秒',
     target_type: 'global',
     duration: 6,
     rarity: 'common',
