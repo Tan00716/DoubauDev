@@ -1,4 +1,5 @@
 import { gameState, type GamePhase, type SquadEntity, type WavePreview, TOTAL_WAVES } from '../gameplay/game-state';
+import { hasSave, continueFromSave, persistSave } from '../gameplay/save-load';
 import { eventBus } from '../core/event-bus';
 import { getUnitData, getBuildingData, getCardData, getEnemyData, COMMANDER, ARMORY_CARDS, TACTIC_CARDS } from '../content/data';
 import type { GameRenderer } from '../renderer/scene';
@@ -11,6 +12,8 @@ export class GameUI {
   private gameOverScreen: HTMLElement | null = null;
   private settlementScreen: HTMLElement | null = null;
   private helpOverlay: HTMLElement | null = null;
+  /** 批次三（MVP-AC-05）：军械册面板收起状态——B 键切换，白天开局默认展开。 */
+  private buildPanelCollapsed = false;
   /** 批次二修复：构造期注册的事件监听注销器集合——支持 destroy()，避免多实例（热重载/测试）下监听泄漏、
    * 游离 DOM 实例继续消费事件并在 getElementById 上抛错（P0 复核同类根因：异常被事件总线吞掉）。 */
   private disposers: (() => void)[] = [];
@@ -45,12 +48,27 @@ export class GameUI {
       eventBus.on('wave-started', ({ wave }) => this.onWaveStarted(wave)),
       eventBus.on('tutorial-dismissed', () => this.onTutorialDismissed()),
     );
+
+    // 批次三（MVP-AC-05）：B 键收起/展开军械册面板（白天）。挂进 disposers，destroy() 时注销。
+    const onKeydown = (e: KeyboardEvent) => {
+      if (e.key === 'b' || e.key === 'B') this.toggleBuildPanel();
+    };
+    document.addEventListener('keydown', onKeydown);
+    this.disposers.push(() => document.removeEventListener('keydown', onKeydown));
   }
 
   /** 注销全部事件监听（测试 / 热重载场景防泄漏；正常游戏单例无需调用）。 */
   destroy(): void {
     for (const off of this.disposers) off();
     this.disposers = [];
+  }
+
+  /** 批次三（MVP-AC-05）：B 键收起/展开军械册面板。只作用于白天军械册；夜间战术手牌面板不受影响。 */
+  private toggleBuildPanel(): void {
+    const panel = document.getElementById('bottom-panel');
+    if (!panel || gameState.phase !== 'day') return;
+    this.buildPanelCollapsed = !this.buildPanelCollapsed;
+    panel.style.display = this.buildPanelCollapsed ? 'none' : 'flex';
   }
 
   /** 跳过引导后：撤横幅 + 解锁终章按钮（战术牌解锁与补抽在按钮回调内完成）。 */
@@ -193,11 +211,30 @@ export class GameUI {
     menu.innerHTML = `
       <div class="eh-title">烬堡 EMBERHOLD</div>
       <div class="eh-subtitle">M1 垂直切片 — 你的城堡，就是你的卡组</div>
+      <button class="eh-btn eh-btn-primary" id="btn-continue" style="display:none;">继续游戏</button>
       <button class="eh-btn eh-btn-primary" id="btn-start">开始新游戏</button>
       <button class="eh-btn eh-btn-secondary" id="btn-help">操作说明</button>
     `;
     this.uiLayer.appendChild(menu);
     this.menuScreen = menu;
+
+    // 批次三（MVP-AC-17）：主菜单「继续游戏」——有档（版本校验通过）才显示。
+    const btnContinue = document.getElementById('btn-continue');
+    if (btnContinue && hasSave()) {
+      btnContinue.style.display = 'block';
+      btnContinue.onclick = () => {
+        // P0 教训同 btn-start：HUD 先挂载再读档——读档 emit phase-change(day) 时
+        // onPhaseChange 要找 #btn-night 等元素，HUD 未挂载则按钮状态永久失步。
+        this.showHUD();
+        if (!continueFromSave(gameState)) {
+          // 档在菜单渲染后被清/损坏（竞态）：回到主菜单，不静默开新局
+          this.showMenu();
+          return;
+        }
+        this.buildPanelCollapsed = false;
+        this.updateResources();
+      };
+    }
 
     document.getElementById('btn-start')!.onclick = () => {
       // P0 修复（质检批次一复核）：showHUD 必须先于 startGame 挂载——
@@ -226,7 +263,9 @@ export class GameUI {
         <ul>
           <li>点击手牌选择建筑/单位卡，再点击地图放置</li>
           <li>点击已放置的班选中，再点击地图移动</li>
+          <li>按 B 键收起 / 展开军械册面板</li>
           <li>点击「入夜」进入夜间防守</li>
+          <li>「存档退出」随时保存并回主菜单，下次「继续游戏」</li>
         </ul>
         <h3>夜间阶段</h3>
         <ul>
@@ -295,6 +334,7 @@ export class GameUI {
       </div>
       <div class="eh-action-bar" id="action-bar">
         <button class="eh-action-btn" id="btn-night" style="display:none;">🌙<br>入夜</button>
+        <button class="eh-action-btn" id="btn-save-quit" style="display:none;">💾<br>存档退出</button>
         <button class="eh-action-btn" id="btn-ultimate" style="display:none;">⚡<br>终章</button>
         <button class="eh-action-btn" id="btn-settle" style="display:none;">☀️<br>天亮</button>
       </div>
@@ -314,6 +354,16 @@ export class GameUI {
 
   private setupHUDEvents(): void {
     document.getElementById('btn-night')!.onclick = () => gameState.startNight();
+    // 批次三（MVP-AC-17）：保存并退出——白天任意时刻落盘 day 档并回主菜单（canSaveInCurrentPhase 守卫）。
+    document.getElementById('btn-save-quit')!.onclick = () => {
+      if (gameState.phase !== 'day') return;
+      if (persistSave(gameState, 'day')) {
+        this.showInfo('已保存，返回主菜单');
+        this.showMenu();
+      } else {
+        this.showInfo('保存失败（存储不可用），进度未落盘');
+      }
+    };
     document.getElementById('btn-ultimate')!.onclick = () => {
       if (gameState.useCommanderUltimate()) {
         this.showInfo('终章已释放！抽3张战术牌！');
@@ -338,6 +388,7 @@ export class GameUI {
   private onPhaseChange(phase: GamePhase): void {
     const badge = document.getElementById('phase-badge');
     const btnNight = document.getElementById('btn-night');
+    const btnSaveQuit = document.getElementById('btn-save-quit');
     const btnUlt = document.getElementById('btn-ultimate');
     const btnSettle = document.getElementById('btn-settle');
     const enemyCounter = document.getElementById('enemy-counter');
@@ -349,6 +400,10 @@ export class GameUI {
       if (badge) badge.textContent = `白天 · 第 ${gameState.dayCount} 天`;
       if (badge) badge.className = 'eh-phase-badge eh-phase-day';
       btnNight?.style.setProperty('display', 'block');
+      // 批次三（MVP-AC-17）：存档退出只在白天可见；B 键收起状态每个白天复位为展开。
+      btnSaveQuit?.style.setProperty('display', 'block');
+      this.buildPanelCollapsed = false;
+      if (bottomPanel) bottomPanel.style.removeProperty('display');
       btnUlt?.style.setProperty('display', 'none');
       btnSettle?.style.setProperty('display', 'none');
       enemyCounter?.style.setProperty('display', 'none');
@@ -358,6 +413,7 @@ export class GameUI {
       if (badge) badge.textContent = `🌙 夜间 · 第 ${gameState.dayCount} 天`;
       if (badge) badge.className = 'eh-phase-badge eh-phase-night';
       btnNight?.style.setProperty('display', 'none');
+      btnSaveQuit?.style.setProperty('display', 'none');
       // 批次二·新手第 1 夜：终章随战术牌层一并锁定（置灰 + 提示），第 2 夜正常开放
       if (gameState.isTutorialNight()) {
         btnUlt?.setAttribute('disabled', 'true');
@@ -611,12 +667,19 @@ export class GameUI {
 
     const settle = document.createElement('div');
     settle.className = 'eh-settlement';
+    // 批次三（MVP-AC-12·结算收支明细）：击杀金币与战意转金分列。
+    // 修复记录：原「战意结余转金」读 gameState.warSpirit——endNight 在结算前已清零 warSpirit，
+    // 恒显示 0；改读 spiritConvertedLastNight（endNight 记账的实际转金值）。
+    // killGoldThisNight 只含击杀奖励（含残兵，口径受 stragglerMode 影响）；goldEarnedThisNight 为总收入（含转金）。
+    const killGold = Math.round(gameState.killGoldThisNight);
+    const spiritGold = gameState.spiritConvertedLastNight;
     settle.innerHTML = `
       <div class="eh-settlement-title">☀️ 夜末清算 · 第 ${gameState.dayCount} 天</div>
       <div class="eh-stat-row">击败敌人: ${gameState.enemiesKilledThisNight}</div>
-      <div class="eh-stat-row">获得金币: ${gameState.goldEarnedThisNight}</div>
+      <div class="eh-stat-row">🪙 击杀金币: ${killGold}</div>
+      <div class="eh-stat-row">🔥 战意结余转金: ${spiritGold}</div>
+      <div class="eh-stat-row">💰 本夜总收入: ${Math.round(gameState.goldEarnedThisNight)}</div>
       <div class="eh-stat-row">阵亡班组: ${gameState.squadsLostThisNight}</div>
-      <div class="eh-stat-row">战意结余转金: ${Math.floor(gameState.warSpirit * 0.5)}</div>
       <div class="eh-stat-row">当前金币: ${gameState.gold}</div>
       <button class="eh-btn eh-btn-primary" id="btn-next-day" style="margin-top:20px;">进入下一天</button>
     `;
