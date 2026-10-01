@@ -1,9 +1,53 @@
 import { eventBus } from '../core/event-bus';
-import { getUnitData, getBuildingData, getEnemyData, getCardData, type CardData, type UnitData, type BuildingData, type EnemyData } from '../content/data';
+import { getUnitData, getBuildingData, getEnemyData, getCardData, type CardData } from '../content/data';
 
 export type GamePhase = 'menu' | 'day' | 'night_transition' | 'night' | 'night_settlement' | 'day_transition' | 'game_over';
 
 export interface Position { x: number; z: number; }
+
+// ===== 设计基准常量（来源：游戏核心设计主文档 rev 26）=====
+// 经济系统资源表：军令/工令初始 6/8，领地攻克 +2 任选，中期扩容至军令 12–18。
+// M1 无领地征服，取设计初始值 6/8。
+export const DESIGN_MILITARY_CAPACITY = 6;
+export const DESIGN_WORK_CAPACITY = 8;
+// 夜间守城节奏：每夜 3–6 分钟，M1 取 240 秒（含波次间隙，不含入夜/天亮过渡动画）。
+export const NIGHT_DURATION = 240;
+export const NIGHT_TRANSITION_SECONDS = 2.0;
+export const DAY_TRANSITION_SECONDS = 1.5;
+// 波次结构：每夜 1–4 波，M1 固定 3 波；波次间隙 15 秒；入夜首波前 5 秒威胁预演。
+export const TOTAL_WAVES = 3;
+export const WAVE_GAP_SECONDS = 15;
+export const WAVE_PREVIEW_LEAD_SECONDS = 5;
+// 战意：接敌班每秒 0.5；撤退后 5 秒战意封锁（经济系统·战意行）。
+export const WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC = 0.5;
+export const RETREAT_WAR_SPIRIT_BLOCK_SECONDS = 5;
+// 通关判定：一局 8 昼夜（一局结构章节「一局 8 昼夜版的标准基准」）。
+export const VICTORY_DAYS = 8;
+
+export interface WaveEntry { enemyId: string; count: number; }
+export interface WavePreview { wave: number; eta: number; entries: WaveEntry[]; }
+
+/** 显式波次表（I2）：按昼夜数与波次号给出确定的敌人构成，无随机刷怪。 */
+export function getWaveComposition(day: number, wave: number): WaveEntry[] {
+  const d = Math.max(1, day);
+  if (wave <= 1) {
+    return [{ enemyId: 'enemy_wolf', count: 2 + d }];
+  }
+  if (wave === 2) {
+    return [
+      { enemyId: 'enemy_wolf', count: 1 + Math.floor(d / 2) },
+      { enemyId: 'enemy_shield_crusher', count: 1 + Math.floor(d / 3) },
+    ];
+  }
+  if (wave === 3) {
+    return [
+      { enemyId: 'enemy_shield_crusher', count: 1 + Math.floor(d / 2) },
+      { enemyId: 'enemy_burrower', count: 1 + Math.floor(d / 2) },
+      { enemyId: 'enemy_wolf', count: d },
+    ];
+  }
+  return [];
+}
 
 export interface SquadEntity {
   id: string;
@@ -16,8 +60,10 @@ export interface SquadEntity {
   focusTarget?: string;
   attackCooldown: number;
   isSelected: boolean;
-  upgradeLevel: number;
+  upgradeLevel: number;      // 0=Lv1, 1=Lv2, 2=Lv3（同名牌升级）
   isEmergency: boolean;
+  warSpiritAccum: number;    // 接敌战意累计（I6）
+  warSpiritBlockTimer: number; // 撤退战意封锁剩余秒数（I6）
   visualUnits: Position[];
 }
 
@@ -28,6 +74,7 @@ export interface BuildingEntity {
   health: number;
   maxHealth: number;
   attackCooldown: number;
+  upgradeLevel: number;      // 0=Lv1, 1=Lv2, 2=Lv3
 }
 
 export interface EnemyEntity {
@@ -56,9 +103,9 @@ export class GameState {
   gold: number = 500;
   warSpirit: number = 0;
   warSpiritMax: number = 40;
-  militaryCapacity: number = 8;
+  militaryCapacity: number = DESIGN_MILITARY_CAPACITY;
   militaryUsed: number = 0;
-  workCapacity: number = 8;
+  workCapacity: number = DESIGN_WORK_CAPACITY;
   workUsed: number = 0;
   mainKeepHealth: number = 1000;
   mainKeepMaxHealth: number = 1000;
@@ -72,15 +119,27 @@ export class GameState {
   tacticDeck: CardData[] = [];
   tacticDiscard: CardData[] = [];
   damagedCamp: { cardId: string; count: number }[] = [];
+  /** 已付费修复、等待再次落阵（半血入场）的卡（I3 归营堆消费）。 */
+  recalledCards: Set<string> = new Set();
 
   activeEffects: TacticEffect[] = [];
 
+  // 波次状态机（I2）：waveNumber 0 = 首波尚未抵达（威胁预演期）
   waveActive: boolean = false;
   waveNumber: number = 0;
   waveTimer: number = 0;
-  waveEnemiesRemaining: number = 0;
+  gapTimer: number = 0;
+  waveEnemiesRemaining: number = 0; // 兼容保留，实际剩余以 enemies.length 为准
   nightTimer: number = 0;
-  nightDuration: number = 120;
+  nightDuration: number = NIGHT_DURATION;
+  wavePreview: WavePreview | null = null;
+  lastTacticDrawAt: number = 0;
+
+  // 阶段过渡计时（I4）：由 update(dt) 驱动，不再使用 setTimeout
+  phaseTimer: number = 0;
+
+  // 胜利路径（I5）：守住第 8 夜后进入通关
+  victoryPending: boolean = false;
 
   commanderUltimateReady: boolean = true;
   commanderUltimateUsedThisNight: boolean = false;
@@ -100,6 +159,7 @@ export class GameState {
   enemiesKilledThisNight: number = 0;
   goldEarnedThisNight: number = 0;
   squadsLostThisNight: number = 0;
+  spiritConvertedLastNight: number = 0;
 
   constructor() {
     this.resetGame();
@@ -116,29 +176,53 @@ export class GameState {
     this.squads = [];
     this.buildings = [];
     this.enemies = [];
-    this.armoryDeck = [];
     this.tacticHand = [];
     this.tacticDeck = [];
     this.tacticDiscard = [];
     this.damagedCamp = [];
+    this.recalledCards = new Set();
     this.activeEffects = [];
     this.waveActive = false;
     this.waveNumber = 0;
+    this.waveTimer = 0;
+    this.gapTimer = 0;
+    this.nightTimer = 0;
+    this.nightDuration = NIGHT_DURATION;
+    this.wavePreview = null;
+    this.lastTacticDrawAt = 0;
+    this.phaseTimer = 0;
+    this.victoryPending = false;
     this.commanderUltimateReady = true;
     this.commanderUltimateUsedThisNight = false;
     this.firstTacticFree = true;
     this.selectedSquadId = null;
+    this.hoveredCardIndex = -1;
+    this.placementCardId = null;
     this.enemiesKilledThisNight = 0;
     this.goldEarnedThisNight = 0;
     this.squadsLostThisNight = 0;
+    this.spiritConvertedLastNight = 0;
 
-    // Initial armory deck
-    const initialCards = ['card_unit_shieldbearer', 'card_unit_archer', 'card_building_wall', 'card_building_arrow_tower'];
-    this.armoryDeck = initialCards.map(id => getCardData(id)!).filter(Boolean);
+    // 初始军械册（B3）：6 张全量——3 单位卡 + 3 建筑卡，克隆以携带 upgrade_level 状态
+    const initialCards = [
+      'card_unit_shieldbearer',
+      'card_unit_archer',
+      'card_unit_pikeman',
+      'card_building_wall',
+      'card_building_arrow_tower',
+      'card_building_barracks',
+    ];
+    this.armoryDeck = initialCards
+      .map(id => getCardData(id))
+      .filter((c): c is CardData => !!c)
+      .map(c => ({ ...c }));
 
-    // Initial tactic deck
+    // 初始战术牌库
     const initialTactics = ['card_tactic_fire_oil', 'card_tactic_shield_wall', 'card_tactic_volley', 'card_tactic_rally'];
-    this.tacticDeck = this.shuffleArray(initialTactics.map(id => getCardData(id)!).filter(Boolean));
+    this.tacticDeck = this.shuffleArray(initialTactics
+      .map(id => getCardData(id))
+      .filter((c): c is CardData => !!c)
+      .map(c => ({ ...c })));
   }
 
   startGame(): void {
@@ -147,85 +231,118 @@ export class GameState {
     eventBus.emit('phase-change', { phase: 'day', day: this.dayCount });
   }
 
+  /**
+   * 主循环驱动（I4）：阶段过渡计时统一在 update(dt) 内推进，
+   * 取代原 setTimeout 方案——切后台时 rAF 与阶段机不再脱钩。
+   */
+  update(dt: number): void {
+    if (this.phase === 'night_transition') {
+      this.phaseTimer -= dt;
+      if (this.phaseTimer <= 0) {
+        this.beginNight();
+      }
+    } else if (this.phase === 'day_transition') {
+      this.phaseTimer -= dt;
+      if (this.phaseTimer <= 0) {
+        this.phase = 'day';
+        eventBus.emit('phase-change', { phase: 'day', day: this.dayCount });
+      }
+    }
+  }
+
   startNight(): void {
     if (this.phase !== 'day') return;
     this.phase = 'night_transition';
+    this.phaseTimer = NIGHT_TRANSITION_SECONDS;
     eventBus.emit('phase-change', { phase: 'night_transition', day: this.dayCount });
+  }
 
-    // Transition delay
-    setTimeout(() => {
-      this.phase = 'night';
-      this.waveActive = true;
-      this.waveNumber = 1;
-      this.waveTimer = 0;
-      this.nightTimer = 0;
-      this.commanderUltimateUsedThisNight = false;
-      this.firstTacticFree = true;
-      this.enemiesKilledThisNight = 0;
-      this.goldEarnedThisNight = 0;
-      this.squadsLostThisNight = 0;
+  /** 入夜过渡结束，真正进入夜间战斗（由 update(dt) 触发）。 */
+  beginNight(): void {
+    this.phase = 'night';
+    this.waveActive = false;
+    this.waveNumber = 0;
+    this.waveTimer = 0;
+    this.gapTimer = WAVE_PREVIEW_LEAD_SECONDS; // 首波抵达前的威胁预演窗口
+    this.nightTimer = 0;
+    this.lastTacticDrawAt = 0;
+    this.commanderUltimateUsedThisNight = false;
+    this.firstTacticFree = true;
+    this.enemiesKilledThisNight = 0;
+    this.goldEarnedThisNight = 0;
+    this.squadsLostThisNight = 0;
+    this.spiritConvertedLastNight = 0;
 
-      // Draw initial tactic hand
-      this.drawTacticCards(3);
+    // 抽初始战术手牌
+    this.drawTacticCards(3);
 
-      eventBus.emit('phase-change', { phase: 'night', day: this.dayCount });
-      eventBus.emit('wave-started', { wave: this.waveNumber });
-    }, 2000);
+    eventBus.emit('phase-change', { phase: 'night', day: this.dayCount });
+    this.setWavePreview(1, this.gapTimer);
   }
 
   endNight(): void {
     if (this.phase !== 'night') return;
     this.phase = 'night_settlement';
     this.waveActive = false;
+    this.wavePreview = null;
 
-    // Clear remaining enemies
+    // 清场残余敌人
     this.enemies = [];
 
-    // Convert excess war spirit to gold (50%)
+    // 战意结余（上限 40，超出部分按 50% 折算为金币）
     if (this.warSpirit > 0) {
       const bonusGold = Math.floor(this.warSpirit * 0.5);
       this.gold += bonusGold;
       this.goldEarnedThisNight += bonusGold;
+      this.spiritConvertedLastNight = bonusGold;
     }
     this.warSpirit = 0;
-
-    // Reset war spirit
     eventBus.emit('war-spirit-changed', this.warSpirit);
 
-    // Emergency squads to damaged camp
+    // 应急增援实体进入受损归营堆（I3）：夜末结算
     for (const sq of this.squads) {
       if (sq.isEmergency) {
-        const card = getCardData(`card_unit_${sq.unitId.replace('unit_', '')}`);
-        if (card) {
-          const existing = this.damagedCamp.find(d => d.cardId === card.card_id);
+        const cardId = `card_unit_${sq.unitId.replace('unit_', '')}`;
+        if (getCardData(cardId)) {
+          const existing = this.damagedCamp.find(d => d.cardId === cardId);
           if (existing) existing.count++;
-          else this.damagedCamp.push({ cardId: card.card_id, count: 1 });
+          else this.damagedCamp.push({ cardId, count: 1 });
         }
       }
     }
     this.squads = this.squads.filter(sq => !sq.isEmergency);
 
+    // 胜利路径（I5）：守住第 8 夜即通关
+    if (this.dayCount >= VICTORY_DAYS) {
+      this.victoryPending = true;
+    }
+
     eventBus.emit('phase-change', { phase: 'night_settlement', day: this.dayCount });
   }
 
   startNextDay(): void {
+    if (this.phase !== 'night_settlement') return;
+
+    // 通关结算优先于进入次日（I5）
+    if (this.victoryPending) {
+      this.gameOver(true);
+      return;
+    }
+
     this.dayCount++;
     this.phase = 'day_transition';
+    this.phaseTimer = DAY_TRANSITION_SECONDS;
 
-    // Heal buildings slightly
+    // 建筑轻微自愈
     for (const b of this.buildings) {
       b.health = Math.min(b.maxHealth, b.health + b.maxHealth * 0.3);
     }
-
-    // Heal squads slightly
+    // 班组轻微自愈
     for (const sq of this.squads) {
       sq.health = Math.min(sq.maxHealth, sq.health + sq.maxHealth * 0.2);
     }
 
-    setTimeout(() => {
-      this.phase = 'day';
-      eventBus.emit('phase-change', { phase: 'day', day: this.dayCount });
-    }, 1500);
+    eventBus.emit('phase-change', { phase: 'day_transition', day: this.dayCount });
   }
 
   gameOver(victory: boolean): void {
@@ -276,12 +393,34 @@ export class GameState {
     }
   }
 
+  /** 波次间隙「弃 2 抽 2」（卡牌系统·战术手牌）。 */
+  discardAndDrawAtGap(): void {
+    const discardCount = Math.min(2, this.tacticHand.length);
+    for (let i = 0; i < discardCount; i++) {
+      this.tacticDiscard.push(this.tacticHand.shift()!);
+    }
+    this.drawTacticCards(2);
+  }
+
+  setWavePreview(wave: number, eta: number): void {
+    if (wave < 1 || wave > TOTAL_WAVES) {
+      this.wavePreview = null;
+      return;
+    }
+    this.wavePreview = { wave, eta, entries: getWaveComposition(this.dayCount, wave) };
+    eventBus.emit('wave-preview', this.wavePreview);
+  }
+
+  clearWavePreview(): void {
+    this.wavePreview = null;
+  }
+
   playTacticCard(handIndex: number, target?: Position): boolean {
     if (handIndex < 0 || handIndex >= this.tacticHand.length) return false;
     const card = this.tacticHand[handIndex];
     let cost = card.cost_night;
 
-    // Commander passive: first tactic card free per night
+    // 指挥官被动：每夜第一张战术牌免费
     if (this.firstTacticFree && card.layer === 'tactic') {
       cost = 0;
       this.firstTacticFree = false;
@@ -292,13 +431,12 @@ export class GameState {
     this.tacticHand.splice(handIndex, 1);
     this.tacticDiscard.push(card);
 
-    // Apply effect
     this.applyTacticEffect(card, target);
 
     eventBus.emit('card-played', { card, target });
 
-    // Draw replacement
-    setTimeout(() => this.drawTacticCards(1), 500);
+    // 立即补牌（I4：去掉 setTimeout 脱钩）
+    this.drawTacticCards(1);
 
     return true;
   }
@@ -349,12 +487,120 @@ export class GameState {
 
     this.commanderUltimateUsedThisNight = true;
     this.drawTacticCards(3);
-    // Hand size +2 for this night (simplified: just allow overflow)
     eventBus.emit('commander-ultimate', {});
     return true;
   }
 
-  spawnSquad(unitId: string, position: Position, isEmergency: boolean = false): boolean {
+  /**
+   * 军械册落阵（I3 + B3 收口）：白天打出单位/建筑卡。
+   * - 同名实体在场 → 升级该实体（Lv1→2→3，规模 +50%/级，M1 无 A/B 分支的简化路径）
+   * - 实体不在场且卡未受损 → 部署新实体（满血）
+   * - 卡在受损归营堆 → 必须先付费修复，修复后部署以半血入场
+   */
+  deployArmoryCard(cardId: string, position: Position): boolean {
+    if (this.phase !== 'day') return false;
+    const card = this.armoryDeck.find(c => c.card_id === cardId);
+    if (!card) return false;
+
+    const damagedEntry = this.damagedCamp.find(d => d.cardId === cardId);
+    if (damagedEntry && damagedEntry.count > 0) return false; // 需先修复
+
+    if (card.category === 'unit') {
+      const unitId = card.card_id.replace('card_unit_', 'unit_');
+      const data = getUnitData(unitId);
+      if (!data) return false;
+
+      const existing = this.squads.find(s => s.unitId === unitId);
+      if (existing) {
+        // 同名牌升级（I3）
+        if (existing.upgradeLevel >= 2) return false; // 已达 Lv3 上限
+        if (!this.spendGold(card.cost_day)) return false;
+        existing.upgradeLevel++;
+        this.applySquadUpgrade(existing);
+        card.upgrade_level = existing.upgradeLevel;
+        eventBus.emit('entity-upgraded', { id: existing.id, level: existing.upgradeLevel, kind: 'squad' });
+        return true;
+      }
+
+      if (this.militaryUsed + data.military_cost > this.militaryCapacity) return false;
+      if (!this.spendGold(card.cost_day)) return false;
+      const isRecall = this.recalledCards.has(cardId);
+      const ok = this.spawnSquad(unitId, position, false, isRecall);
+      if (!ok) {
+        this.addGold(card.cost_day);
+        return false;
+      }
+      if (isRecall) this.recalledCards.delete(cardId);
+      return true;
+    }
+
+    if (card.category === 'building') {
+      const buildingId = card.card_id.replace('card_building_', 'building_');
+      const data = getBuildingData(buildingId);
+      if (!data) return false;
+
+      const existing = this.buildings.find(b => b.buildingId === buildingId);
+      if (existing) {
+        // 同名牌升级（I3）
+        if (existing.upgradeLevel >= 2) return false;
+        if (!this.spendGold(card.cost_day)) return false;
+        existing.upgradeLevel++;
+        this.applyBuildingUpgrade(existing);
+        card.upgrade_level = existing.upgradeLevel;
+        eventBus.emit('entity-upgraded', { id: existing.id, level: existing.upgradeLevel, kind: 'building' });
+        return true;
+      }
+
+      if (this.workUsed + data.work_cost > this.workCapacity) return false;
+      if (!this.spendGold(card.cost_day)) return false;
+      const isRecall = this.recalledCards.has(cardId);
+      const ok = this.spawnBuilding(buildingId, position, isRecall);
+      if (!ok) {
+        this.addGold(card.cost_day);
+        return false;
+      }
+      if (isRecall) this.recalledCards.delete(cardId);
+      return true;
+    }
+
+    return false;
+  }
+
+  /** 同名牌升级：规模 +50%/级（M1 简化：属性路径；A/B 机制分支留待 MVP）。 */
+  private applySquadUpgrade(sq: SquadEntity): void {
+    const data = getUnitData(sq.unitId);
+    if (!data) return;
+    sq.maxHealth = data.max_health * (1 + 0.5 * sq.upgradeLevel);
+    sq.health += data.max_health * 0.5;
+  }
+
+  private applyBuildingUpgrade(b: BuildingEntity): void {
+    const data = getBuildingData(b.buildingId);
+    if (!data) return;
+    b.maxHealth = data.max_durability * (1 + 0.5 * b.upgradeLevel);
+    b.health += data.max_durability * 0.5;
+  }
+
+  /** 受损归营堆消费（I3）：次日白天花 50% 金币修复，修复后落阵以半血入场。 */
+  repairDamagedCard(cardId: string): boolean {
+    const entry = this.damagedCamp.find(d => d.cardId === cardId);
+    if (!entry || entry.count <= 0) return false;
+    const card = this.armoryDeck.find(c => c.card_id === cardId);
+    if (!card) return false;
+
+    const cost = Math.ceil(card.cost_day * 0.5);
+    if (!this.spendGold(cost)) return false;
+
+    entry.count--;
+    if (entry.count <= 0) {
+      this.damagedCamp = this.damagedCamp.filter(d => d.count > 0);
+    }
+    this.recalledCards.add(cardId);
+    eventBus.emit('damaged-camp-changed', {});
+    return true;
+  }
+
+  spawnSquad(unitId: string, position: Position, isEmergency: boolean = false, halfHealth: boolean = false): boolean {
     const data = getUnitData(unitId);
     if (!data) return false;
 
@@ -366,23 +612,24 @@ export class GameState {
       id: `squad_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       unitId,
       position: { ...position },
-      health: data.max_health,
+      health: data.max_health * (halfHealth ? 0.5 : 1),
       maxHealth: data.max_health,
       command: 'hold',
       attackCooldown: 0,
       isSelected: false,
       upgradeLevel: 0,
       isEmergency,
+      warSpiritAccum: 0,
+      warSpiritBlockTimer: 0,
       visualUnits: this.generateSquadFormation(data.squad_size),
     };
 
     this.squads.push(squad);
     this.militaryUsed += data.military_cost;
-    eventBus.emit('squad-selected', null);
     return true;
   }
 
-  spawnBuilding(buildingId: string, position: Position): boolean {
+  spawnBuilding(buildingId: string, position: Position, halfHealth: boolean = false): boolean {
     const data = getBuildingData(buildingId);
     if (!data) return false;
 
@@ -394,9 +641,10 @@ export class GameState {
       id: `building_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       buildingId,
       position: { ...position },
-      health: data.max_durability,
+      health: data.max_durability * (halfHealth ? 0.5 : 1),
       maxHealth: data.max_durability,
       attackCooldown: 0,
+      upgradeLevel: 0,
     };
 
     this.buildings.push(building);
@@ -425,6 +673,34 @@ export class GameState {
 
     this.enemies.push(enemy);
     eventBus.emit('enemy-spawned', enemy);
+  }
+
+  /** 班组阵亡（夜间）：常规班对应卡进入归营堆；应急增援直接消散。 */
+  squadDestroyed(sq: SquadEntity): void {
+    if (!sq.isEmergency) {
+      const cardId = `card_unit_${sq.unitId.replace('unit_', '')}`;
+      if (getCardData(cardId)) {
+        const entry = this.damagedCamp.find(d => d.cardId === cardId);
+        if (entry) entry.count++;
+        else this.damagedCamp.push({ cardId, count: 1 });
+        eventBus.emit('damaged-camp-changed', {});
+      }
+    }
+    this.removeSquad(sq.id);
+    this.squadsLostThisNight++;
+  }
+
+  /** 建筑被摧毁：对应卡进入归营堆。 */
+  buildingDestroyed(b: BuildingEntity): void {
+    const cardId = `card_building_${b.buildingId.replace('building_', '')}`;
+    if (getCardData(cardId)) {
+      const entry = this.damagedCamp.find(d => d.cardId === cardId);
+      if (entry) entry.count++;
+      else this.damagedCamp.push({ cardId, count: 1 });
+      eventBus.emit('damaged-camp-changed', {});
+    }
+    eventBus.emit('entity-destroyed', { id: b.id });
+    this.removeBuilding(b.id);
   }
 
   removeSquad(squadId: string): void {
@@ -483,6 +759,11 @@ export class GameState {
     sq.command = command;
     if (targetPos) sq.targetPosition = { ...targetPos };
     if (targetId) sq.focusTarget = targetId;
+
+    // 撤退触发 5 秒战意封锁（I6，经济系统·战意行）
+    if (command === 'retreat') {
+      sq.warSpiritBlockTimer = RETREAT_WAR_SPIRIT_BLOCK_SECONDS;
+    }
 
     eventBus.emit('squad-command', { squadId: sq.id, command, targetPos, targetId });
   }
