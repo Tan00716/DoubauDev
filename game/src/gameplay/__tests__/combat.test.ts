@@ -325,3 +325,111 @@ describe('N1：紧急增援出牌预检与退款兜底', () => {
     expect(gameState.militaryUsed).toBe(1);
   });
 });
+
+
+describe('N4：修复即含再入场（一次性 50% 金币，无二次收费）', () => {
+  it('修复只扣 50% 金币，落阵免费且半血，不再有第二次收费', () => {
+    gameState.resetGame();
+    gameState.phase = 'day';
+    const card = getCardData('card_unit_pikeman')!;
+    gameState.gold = 200;
+
+    gameState.deployArmoryCard('card_unit_pikeman', { x: 0, z: 0 });
+    const sq = gameState.squads.find(s => s.unitId === 'unit_pikeman')!;
+    gameState.squadDestroyed(sq);
+
+    // 第一次收费：修复 50%（含再入场）
+    const goldAfterDeploy = gameState.gold;
+    expect(gameState.repairDamagedCard('card_unit_pikeman')).toBe(true);
+    expect(gameState.gold).toBe(goldAfterDeploy - Math.ceil(card.cost_day * 0.5));
+
+    // 第二次收费不存在：落阵金币不动，实体以半血可部署状态入场
+    expect(gameState.deployArmoryCard('card_unit_pikeman', { x: 2, z: 2 })).toBe(true);
+    expect(gameState.gold).toBe(goldAfterDeploy - Math.ceil(card.cost_day * 0.5));
+    const respawn = gameState.squads.find(s => s.unitId === 'unit_pikeman')!;
+    expect(respawn).toBeDefined();
+    expect(respawn.health).toBe(getUnitData('unit_pikeman')!.max_health * 0.5);
+    expect(gameState.recalledPending.get('card_unit_pikeman')).toBeUndefined();
+
+    // 未受损卡正常部署仍收全额（对照组，确认免费只来自修复名额）
+    const goldBeforeArcher = gameState.gold;
+    expect(gameState.deployArmoryCard('card_unit_archer', { x: 3, z: 3 })).toBe(true);
+    expect(gameState.gold).toBe(goldBeforeArcher - getCardData('card_unit_archer')!.cost_day);
+  });
+
+  it('同名卡受损 count>1：逐张修复各扣 50%，名额计数不丢失', () => {
+    gameState.resetGame();
+    gameState.phase = 'day';
+    const card = getCardData('card_unit_pikeman')!;
+    gameState.gold = 500;
+    // 直接构造归营堆两张（一队阵亡 + 一支应急同源班夜末归堆的等价场景）
+    gameState.damagedCamp = [{ cardId: 'card_unit_pikeman', count: 2 }];
+
+    const gold0 = gameState.gold;
+    expect(gameState.repairDamagedCard('card_unit_pikeman')).toBe(true);
+    expect(gameState.gold).toBe(gold0 - Math.ceil(card.cost_day * 0.5));
+    expect(gameState.damagedCamp[0].count).toBe(1);
+    expect(gameState.recalledPending.get('card_unit_pikeman')).toBe(1);
+
+    // 堆里还有一张受损卡 → 不允许直接部署（须先修复）
+    expect(gameState.deployArmoryCard('card_unit_pikeman', { x: 0, z: 0 })).toBe(false);
+
+    expect(gameState.repairDamagedCard('card_unit_pikeman')).toBe(true);
+    expect(gameState.gold).toBe(gold0 - 2 * Math.ceil(card.cost_day * 0.5));
+    expect(gameState.damagedCamp.length).toBe(0);
+    expect(gameState.recalledPending.get('card_unit_pikeman')).toBe(2);
+
+    // 第一次落阵：免费半血，消耗一张名额
+    const goldBeforeDeploy = gameState.gold;
+    expect(gameState.deployArmoryCard('card_unit_pikeman', { x: 1, z: 1 })).toBe(true);
+    expect(gameState.gold).toBe(goldBeforeDeploy);
+    expect(gameState.recalledPending.get('card_unit_pikeman')).toBe(1);
+
+    // 第二次落阵（同名升级路径之外的再次入场）：仍免费半血，名额清零
+    const first = gameState.squads.find(s => s.unitId === 'unit_pikeman')!;
+    gameState.removeSquad(first.id); // 模拟再次阵亡后的直接再部署（名额仍在）
+    expect(gameState.deployArmoryCard('card_unit_pikeman', { x: 2, z: 2 })).toBe(true);
+    expect(gameState.gold).toBe(goldBeforeDeploy);
+    expect(gameState.recalledPending.get('card_unit_pikeman')).toBeUndefined();
+    const second = gameState.squads.find(s => s.unitId === 'unit_pikeman')!;
+    expect(second.health).toBe(getUnitData('unit_pikeman')!.max_health * 0.5);
+  });
+});
+
+describe('N3：紧急增援牌入初始战术牌库', () => {
+  it('resetGame 后牌库含 5 张战术牌，紧急增援可获得（4→5）', () => {
+    gameState.resetGame();
+    const ids = gameState.tacticDeck.map(c => c.card_id).sort();
+    expect(ids).toHaveLength(5);
+    expect(ids).toContain('card_tactic_reinforce');
+    expect(ids).toEqual([
+      'card_tactic_fire_oil',
+      'card_tactic_rally',
+      'card_tactic_reinforce',
+      'card_tactic_shield_wall',
+      'card_tactic_volley',
+    ]);
+  });
+});
+
+describe('M1 校准：敌方伤害 ×0.6 落地', () => {
+  it('狼 4 / 盾卫 6 / 掘地者 5（设计文档 rev30 附录基准）', () => {
+    expect(getEnemyData('enemy_wolf')!.damage).toBe(4);
+    expect(getEnemyData('enemy_shield_crusher')!.damage).toBe(6);
+    expect(getEnemyData('enemy_burrower')!.damage).toBe(5);
+  });
+
+  it('B1 断言在新数值下仍成立：10 秒掉血 = 10×4', () => {
+    setupNightArena();
+    gameState.spawnSquad('unit_shieldbearer', { x: 0, z: 0 });
+    const squad = gameState.squads[0];
+    squad.command = 'hold';
+    gameState.spawnEnemy('enemy_wolf', { x: 1.0, z: 0 });
+    const wolf = gameState.enemies[0];
+    wolf.health = 1e9;
+    wolf.maxHealth = 1e9;
+    const hpBefore = squad.health;
+    simulate(10, 1 / 60);
+    expect(hpBefore - squad.health).toBe(40);
+  });
+});
