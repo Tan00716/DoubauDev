@@ -1,16 +1,19 @@
-import { gameState, type GamePhase, type SquadEntity } from '../gameplay/game-state';
+import { gameState, type GamePhase, type SquadEntity, type WavePreview, TOTAL_WAVES } from '../gameplay/game-state';
 import { eventBus } from '../core/event-bus';
-import { getUnitData, getBuildingData, getCardData, COMMANDER, ARMORY_CARDS, TACTIC_CARDS } from '../content/data';
+import { getUnitData, getBuildingData, getCardData, getEnemyData, COMMANDER, ARMORY_CARDS, TACTIC_CARDS } from '../content/data';
+import type { GameRenderer } from '../renderer/scene';
 
 export class GameUI {
   private uiLayer: HTMLElement;
+  private renderer: GameRenderer;
   private menuScreen: HTMLElement | null = null;
   private hudScreen: HTMLElement | null = null;
   private gameOverScreen: HTMLElement | null = null;
   private settlementScreen: HTMLElement | null = null;
 
-  constructor() {
+  constructor(renderer: GameRenderer) {
     this.uiLayer = document.getElementById('ui-layer')!;
+    this.renderer = renderer;
     this.createStyles();
     this.showMenu();
 
@@ -23,6 +26,12 @@ export class GameUI {
     eventBus.on('building-placed', () => this.updateArmoryDeck());
     eventBus.on('enemy-spawned', () => this.updateEnemyCount());
     eventBus.on('entity-destroyed', () => this.updateEnemyCount());
+    eventBus.on('entity-upgraded', ({ kind, level }) => this.showInfo(`⬆️ 升级成功：${kind === 'squad' ? '班组' : '建筑'} 提升至 Lv${level + 1}，规模 +50%`));
+    eventBus.on('damaged-camp-changed', () => {
+      this.updateDamagedCampPanel();
+      this.updateArmoryDeck();
+    });
+    eventBus.on('wave-preview', (preview: WavePreview) => this.showWavePreview(preview));
   }
 
   private createStyles(): void {
@@ -79,6 +88,16 @@ export class GameUI {
       .eh-zoom-controls { position:absolute; bottom:10px; left:10px; display:flex; gap:4px; }
       .eh-zoom-btn { width:32px; height:32px; border-radius:4px; border:1px solid #555; background:#2c3e50; color:#fff; cursor:pointer; font-size:16px; }
       .eh-zoom-btn:hover { background:#4a6278; }
+      .eh-damaged-panel { position:absolute; top:110px; left:20px; background:rgba(0,0,0,0.75); border:1px solid #e67e22; border-radius:8px; padding:10px; min-width:200px; }
+      .eh-damaged-title { font-size:14px; font-weight:bold; color:#e67e22; margin-bottom:6px; }
+      .eh-damaged-row { display:flex; justify-content:space-between; align-items:center; gap:10px; font-size:12px; color:#ddd; margin:4px 0; }
+      .eh-repair-btn { padding:4px 8px; font-size:11px; border:none; border-radius:4px; cursor:pointer; background:#e67e22; color:#fff; }
+      .eh-repair-btn:hover { background:#d35400; }
+      .eh-card-lv { position:absolute; bottom:4px; left:4px; background:#f1c40f; color:#000; padding:1px 5px; border-radius:3px; font-size:10px; font-weight:bold; }
+      .eh-card-damaged { position:absolute; bottom:4px; right:4px; background:#e74c3c; color:#fff; padding:1px 5px; border-radius:3px; font-size:10px; font-weight:bold; }
+      .eh-card-recalled { position:absolute; bottom:4px; right:4px; background:#27ae60; color:#fff; padding:1px 5px; border-radius:3px; font-size:10px; font-weight:bold; }
+      .eh-card-dim { filter:grayscale(0.8) brightness(0.7); }
+      .eh-wave-banner { position:absolute; top:100px; left:50%; transform:translateX(-50%); background:rgba(231,76,60,0.85); color:#fff; padding:8px 20px; border-radius:6px; font-size:14px; font-weight:bold; }
     `;
     document.head.appendChild(style);
   }
@@ -187,11 +206,11 @@ export class GameUI {
     document.getElementById('sq-focus')!.onclick = () => gameState.issueSquadCommand('focus');
 
     document.getElementById('zoom-in')!.onclick = () => {
-      // Access renderer through global for zoom
-      (window as any).gameRenderer?.setZoom(gameState.cameraZoom - 0.2);
+      // S6：通过构造注入的 renderer 访问，不再依赖 window 全局
+      this.renderer.setZoom(gameState.cameraZoom - 0.2);
     };
     document.getElementById('zoom-out')!.onclick = () => {
-      (window as any).gameRenderer?.setZoom(gameState.cameraZoom + 0.2);
+      this.renderer.setZoom(gameState.cameraZoom + 0.2);
     };
   }
 
@@ -211,6 +230,7 @@ export class GameUI {
       btnSettle!.style.display = 'none';
       enemyCounter!.style.display = 'none';
       this.updateArmoryDeck();
+      this.updateDamagedCampPanel();
     } else if (phase === 'night') {
       badge!.textContent = `🌙 夜间 · 第 ${gameState.dayCount} 天`;
       badge!.className = 'eh-phase-badge eh-phase-night';
@@ -237,12 +257,21 @@ export class GameUI {
     for (const card of gameState.armoryDeck) {
       const isSelected = gameState.placementCardId === card.card_id;
       const costText = card.cost_day > 0 ? `${card.cost_day}金` : '免费';
+      // I3：卡面等级 / 受损 / 已修复状态徽标
+      const lvl = card.upgrade_level ?? 0;
+      const lvBadge = lvl > 0 ? `<div class="eh-card-lv">Lv${lvl + 1}</div>` : '';
+      const damaged = gameState.damagedCamp.find(d => d.cardId === card.card_id);
+      const damagedBadge = damaged ? `<div class="eh-card-damaged">受损×${damaged.count}</div>` : '';
+      const recalled = !damaged && gameState.recalledCards.has(card.card_id)
+        ? '<div class="eh-card-recalled">已修复·半血</div>' : '';
+      const dimClass = damaged ? 'eh-card-dim' : '';
       html += `
-        <div class="eh-card ${isSelected ? 'eh-card-selected' : ''}" data-card="${card.card_id}">
+        <div class="eh-card ${isSelected ? 'eh-card-selected' : ''} ${dimClass}" data-card="${card.card_id}">
           <div class="eh-card-layer eh-layer-armory">军械</div>
           <div class="eh-card-cost">${costText}</div>
           <div class="eh-card-name">${card.card_name}</div>
           <div class="eh-card-desc">${card.effect_description}</div>
+          ${lvBadge}${damagedBadge}${recalled}
         </div>
       `;
     }
@@ -342,7 +371,76 @@ export class GameUI {
 
   private updateEnemyCount(): void {
     const el = document.getElementById('enemy-counter');
-    if (el) el.textContent = `敌人: ${gameState.enemies.length}`;
+    if (!el) return;
+    const waveText = gameState.waveActive
+      ? ` · 第 ${gameState.waveNumber}/${TOTAL_WAVES} 波`
+      : gameState.wavePreview
+        ? ` · 第 ${gameState.wavePreview.wave} 波来袭倒计时`
+        : '';
+    el.textContent = `敌人: ${gameState.enemies.length}${waveText}`;
+  }
+
+  /** I3：受损归营堆修复面板（白天显示，50% 金币修复，修复后落阵半血入场）。 */
+  private updateDamagedCampPanel(): void {
+    let panel = document.getElementById('damaged-camp-panel');
+
+    if (gameState.phase !== 'day' || gameState.damagedCamp.length === 0) {
+      if (panel) panel.remove();
+      return;
+    }
+
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'damaged-camp-panel';
+      panel.className = 'eh-damaged-panel';
+      this.uiLayer.appendChild(panel);
+    }
+
+    let html = '<div class="eh-damaged-title">🩹 受损归营堆（次日修复）</div>';
+    for (const d of gameState.damagedCamp) {
+      const card = getCardData(d.cardId);
+      const cost = Math.ceil((card?.cost_day ?? 0) * 0.5);
+      html += `
+        <div class="eh-damaged-row">
+          <span>${card?.card_name ?? d.cardId} ×${d.count}</span>
+          <button class="eh-repair-btn" data-repair="${d.cardId}">修复 ${cost}金</button>
+        </div>
+      `;
+    }
+    panel.innerHTML = html;
+
+    for (const btn of Array.from(panel.querySelectorAll('[data-repair]'))) {
+      btn.addEventListener('click', () => {
+        const cardId = (btn as HTMLElement).dataset.repair!;
+        if (gameState.repairDamagedCard(cardId)) {
+          this.showInfo('修复完成，再次落阵时半血入场');
+        } else {
+          this.showInfo('金币不足，无法修复');
+        }
+      });
+    }
+  }
+
+  /** I2：威胁预演横幅（波次构成 + 抵达倒计时）。 */
+  private showWavePreview(preview: WavePreview): void {
+    const old = document.querySelector('.eh-wave-banner');
+    if (old) old.remove();
+    if (!preview) return;
+
+    const enemyNames = preview.entries
+      .map(e => {
+        const data = getEnemyData(e.enemyId);
+        return `${data?.enemy_name ?? e.enemyId}×${e.count}`;
+      })
+      .join('、');
+
+    const banner = document.createElement('div');
+    banner.className = 'eh-wave-banner';
+    banner.textContent = `⚠️ 威胁预演：第 ${preview.wave} 波（${enemyNames}）约 ${Math.ceil(preview.eta)} 秒后抵达`;
+    this.uiLayer.appendChild(banner);
+    setTimeout(() => banner.remove(), 6000);
+
+    this.updateEnemyCount();
   }
 
   private showInfo(text: string): void {
