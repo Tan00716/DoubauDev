@@ -299,16 +299,22 @@ export class GameState {
     this.warSpirit = 0;
     eventBus.emit('war-spirit-changed', this.warSpirit);
 
-    // 应急增援实体进入受损归营堆（I3）：夜末结算
+    // 应急增援夜末消散（产品定案第 4 条「召唤物、夜末消散」；设计主文档 rev32 战术卡表同口径）。
+    // 修复记录：M1-v2 起此处的临时代码把应急班送入受损归营堆（I3 注释误导），与设计意图相反——
+    // 若可 50% 修复再入场，7 战意等于买到持续实体，与「廉价消散召唤物」定价逻辑（rev32 终裁）冲突。批次一裁决：按消散固化。
+    // 记账修复：消散必须同步释放军令占用（原 filter 直接改数组绕过 removeSquad，导致容量被幽灵占用）。
+    let emergencyReleased = 0;
     for (const sq of this.squads) {
       if (sq.isEmergency) {
-        const cardId = `card_unit_${sq.unitId.replace('unit_', '')}`;
-        if (getCardData(cardId)) {
-          const existing = this.damagedCamp.find(d => d.cardId === cardId);
-          if (existing) existing.count++;
-          else this.damagedCamp.push({ cardId, count: 1 });
+        const unitData = getUnitData(sq.unitId);
+        if (unitData) {
+          this.militaryUsed -= unitData.military_cost;
+          emergencyReleased++;
         }
       }
+    }
+    if (emergencyReleased > 0) {
+      eventBus.emit('military-changed', this.militaryUsed);
     }
     this.squads = this.squads.filter(sq => !sq.isEmergency);
 
@@ -483,10 +489,12 @@ export class GameState {
         });
         break;
       case 'card_tactic_volley':
+        // 攻速加成参数从未被 combat.ts 消费（实际生效的是射程×1.3 与伤害×1.5，见 combat.ts updateSquads），
+        // 质检清理项：删除死参数 attackSpeedBonus
         this.activeEffects.push({
           type: 'volley',
           duration: card.duration,
-          params: { attackSpeedBonus: 0.5 },
+          params: {},
         });
         break;
       case 'card_tactic_reinforce':
