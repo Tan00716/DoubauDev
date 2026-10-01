@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { gameState, TOTAL_WAVES, WAVE_GAP_SECONDS, NIGHT1_WAVE_GAP_SECONDS, WAVE_PREVIEW_LEAD_SECONDS } from '../game-state';
+import { gameState, TOTAL_WAVES, WAVE_GAP_SECONDS, NIGHT1_WAVE_GAP_SECONDS, WAVE_PREVIEW_LEAD_SECONDS, getNightRouteAngles } from '../game-state';
 import { updateCombat } from '../combat';
 import { SpatialGrid } from '../spatial-grid';
 
@@ -31,13 +31,18 @@ function setupNight(day: number, runCount: number, heavy = false): void {
   gameState.buildings = [];
   gameState.squads = [];
   if (heavy) {
-    // 高敌量夜（≥第 4 夜）：环形防御——8 个弓手班驻半径 10 圆周，覆盖多数生成角度
-    for (let i = 0; i < 8; i++) {
-      const angle = (i / 8) * Math.PI * 2;
-      gameState.spawnSquad('unit_archer', { x: Math.cos(angle) * 10, z: Math.sin(angle) * 10 });
-      gameState.squads[gameState.squads.length - 1].command = 'hold';
+    // 高敌量夜（≥第 4 夜）。批次三适配：多路进攻制（MVP-AC-07/14）落地后，敌人不再全图随机散布、
+    // 而是沿本夜路线集中进场——原「环形等距防御」对新机制不再是合理布阵（敌群集中突破无防方向，主堡被啃穿）。
+    // 改为沿路线方向布防（威胁预演会显示路线，玩家据此针对性布阵正是该验收项的设计意图）：
+    // 每条路线 4 名弓手覆盖接近走廊（±0.35 弧度内射程全覆盖），主路线贴堡补 1 名盾卫承伤。
+    const routes = getNightRouteAngles(day);
+    for (const route of routes) {
+      for (const off of [-0.35, -0.12, 0.12, 0.35]) {
+        gameState.spawnSquad('unit_archer', { x: Math.cos(route + off) * 10, z: Math.sin(route + off) * 10 });
+        gameState.squads[gameState.squads.length - 1].command = 'hold';
+      }
     }
-    gameState.spawnSquad('unit_shieldbearer', { x: 2, z: 0 });
+    gameState.spawnSquad('unit_shieldbearer', { x: Math.cos(routes[0]) * 2, z: Math.sin(routes[0]) * 2 });
     gameState.squads[gameState.squads.length - 1].command = 'hold';
   } else {
     // 防守编成：盾卫顶前排 + 弓手输出（贴近主堡，模拟真实布阵而非瞬杀）
