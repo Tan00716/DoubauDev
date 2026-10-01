@@ -423,7 +423,7 @@ describe('放宽变体（校准建议参数）', () => {
     let wins = 0;
     const RUNS = 200;
     for (let i = 0; i < RUNS; i++) {
-      if (runSingleSimulation('baseline', i, 20261001 + i, 'ease_dmg_0_6', 'nearest', { stragglerOff: true }).victory) wins++;
+      if (runSingleSimulation('baseline', i, 20261001 + i, 'ease_dmg_0_6', 'nearest', { stragglerMode: 'off' }).victory) wins++;
     }
     expect(wins / RUNS).toBeGreaterThan(0.3);
     expect(wins / RUNS).toBeLessThan(0.8);
