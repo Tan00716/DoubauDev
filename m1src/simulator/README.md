@@ -1,7 +1,7 @@
-# EMBERHOLD 战斗数值模拟器 v2.4
+# EMBERHOLD 战斗数值模拟器 v2.5
 
 《烬堡 EMBERHOLD》无头战斗数值模拟器（Node.js CLI），批量模拟「昼采购 / 夜守城」循环并输出平衡报表。
-v2.1 对齐 game M1 四批修复（commit 37f798f0）；v2.4 同步批次二节奏（game v7：预演 3s / 波间 10s / 首夜 6s / 第 2 夜起波间过半刷 2 只落单残兵）。
+v2.1 对齐 game M1 四批修复（commit 37f798f0）；v2.4 同步批次二节奏（game v7：预演 3s / 波间 10s / 首夜 6s / 第 2 夜起波间过半刷 2 只落单残兵）；v2.5 实现残兵口径五档旋钮 stragglerMode（对齐 game 批次三，`settleKill` 统一击杀结算）。
 
 ## 模型口径（与 game 逐条对齐）
 
@@ -131,7 +131,37 @@ N3 定案「紧急增援战术牌入池」后（game 侧约一行改动），量
 | 残兵 1 只/波间 | 63.0% |
 | 残兵 2 只/波间（game v7 现状） | **93.3%**（turtle 97.7% / aggressive 92.3%） |
 
-game 侧残兵同样计奖励 → 难度同样会下降（幅度取决于玩家操作，方向确定）。若要保 40–70% 难度带，选项：残兵不计击杀奖励/战意（纯填充）· 减为 1 只 · 奖励减半。测试已锁定该事实（`批次二·落单残兵显著抬升胜率`），game 侧调整后需同步更新。
+game 侧残兵同样计奖励 → 难度同样会下降（幅度取决于玩家操作，方向确定）。测试已锁定该事实（`批次二·落单残兵显著抬升胜率`）。
+
+### 残兵口径五档实验（v2.5，`scripts/straggler-modes.ts`，对齐 game stragglerMode）
+
+批次三 game 侧真实打法测试批（各 30 局）五档全部落在/贴近 40–70% 带；模拟器侧（近最优采购，各 1000 局 × 3 preset，ease_dmg_0_6）对照：
+
+| 模式 | baseline | turtle | aggressive | game 实测（baseline 型打法） |
+| --- | --- | --- | --- | --- |
+| default（2 只全额，v7 现状） | 93.1% | 97.7% | 92.3% | 43.3% |
+| no_reward（2 只零奖励） | 54.2% | 62.2% | 48.5% | 40.0% |
+| single（1 只全额） | 61.8% | 67.3% | 51.3% | 50.0% |
+| half_reward（2 只减半） | 75.1% | 85.8% | 73.5% | 53.3% |
+| off（不刷） | 50.8% | 60.5% | 50.8% | 60.0% |
+
+- **模拟器侧冲击 100% 来自击杀奖励**：no_reward（54.2%）≈ off（50.8%），残兵接敌期的战意贡献可忽略（存活时间短）
+- **half_reward 压不回带上沿**（75–86% 仍超 70%）：减半后仍有 +4 金/+5 意/夜，最优玩家仍能滚雪球
+- 把最优玩家压回带内的档位：**no_reward / single / off**；其中 no_reward 保留全部空窗填充收益（残兵在场）且模拟器侧带内，是收紧候选中的最优解；single 次之；维持 default 则难度带以普通玩家为基准（game 实测带内，高手上限由难度层承接）
+
+### 增援牌定价跨口径预复验（v2.5，`scripts/reinforce-repricing.ts`，各 500 局）
+
+| 口径 | cost | baseline | turtle | aggressive |
+| --- | --- | --- | --- | --- |
+| default | 6/7/8 | 91.4/91.6/91.6% | 92.8/92.6/93.2% | 87.4/85.8/88.2% |
+| default | 10 | 77.8% | 81.6% | 74.2% |
+| no_reward | 6/7 | 62.4/63.4% | 72.0/73.8% | 55.0/55.2% |
+| no_reward | 8 | 57.4% | 63.0% | 43.6% |
+| no_reward | 10 | 28.8% | 26.2% | 22.0% |
+
+- **default 口径下 6–8 意无差异**（天花板效应：最优玩家基线已 93%，牌加不动）；**10 意在两个口径下都是谷底**，与旧曲线一致
+- **no_reward 口径下 7 意仍是甜点档**：63.4/73.8/55.2%，全部带内，相对 off 基线 +8~+13pp，「牌从陷阱变可选」仍成立；8 意已开始掉（aggressive 43.6%）
+- **定价结论对残兵口径不敏感：维持 7 意推荐**（两口径均支持）
 
 ## Quick Start
 
@@ -159,6 +189,12 @@ npx tsx scripts/reinforce-price-sweep.ts
 # 批次二空窗交叉复核（逐夜空窗占比 × 3 preset）
 npx tsx scripts/idle-crosscheck.ts
 
+# 残兵口径五档实验（对齐 game stragglerMode）
+npx tsx scripts/straggler-modes.ts
+
+# 增援牌定价跨口径预复验
+npx tsx scripts/reinforce-repricing.ts
+
 # 单测（22 个，含口径锁定）
 npm test
 ```
@@ -181,6 +217,8 @@ scripts/reinforce-pricing.ts      # 定价三方案验证（主实验）
 scripts/reinforce-a10-diagnosis.ts / -ablation.ts / -price-sweep.ts  # A10 非单调异常定位
 scripts/reinforce-cross-seed.ts   # 关键定价档跨种子复验
 scripts/idle-crosscheck.ts        # 批次二空窗交叉复核（game 口径）
+scripts/straggler-modes.ts        # 残兵口径五档实验（对齐 game stragglerMode）
+scripts/reinforce-repricing.ts    # 增援牌定价跨口径预复验
 tests/engine.test.ts   # 31 个单测（口径锁定 + 回归 + 定价方案接线）
 reports/               # 输出报表 JSON
 ```
