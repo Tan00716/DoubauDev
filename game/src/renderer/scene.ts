@@ -23,6 +23,10 @@ export class GameRenderer {
   // Ground
   private groundMesh!: THREE.Mesh;
   private keepMesh!: THREE.Mesh;
+  private gridHelper!: THREE.GridHelper;
+  // N5：主堡火焰 mesh 与点光（原局部变量，dispose 无法触达）
+  private keepFlameMesh!: THREE.Mesh;
+  private keepFlameLight!: THREE.PointLight;
 
   // Selection indicator
   private selectionRing!: THREE.Mesh;
@@ -106,9 +110,9 @@ export class GameRenderer {
     this.scene.add(this.groundMesh);
 
     // Grid
-    const grid = new THREE.GridHelper(60, 60, 0x555555, 0x444444);
-    grid.position.y = 0.01;
-    this.scene.add(grid);
+    this.gridHelper = new THREE.GridHelper(60, 60, 0x555555, 0x444444);
+    this.gridHelper.position.y = 0.01;
+    this.scene.add(this.gridHelper);
   }
 
   private createMainKeep(): void {
@@ -122,14 +126,14 @@ export class GameRenderer {
     // Keep flame
     const flameGeo = new THREE.ConeGeometry(0.5, 1.5, 8);
     const flameMat = new THREE.MeshBasicMaterial({ color: 0xff6600 });
-    const flame = new THREE.Mesh(flameGeo, flameMat);
-    flame.position.set(0, 4.5, 0);
-    this.scene.add(flame);
+    this.keepFlameMesh = new THREE.Mesh(flameGeo, flameMat);
+    this.keepFlameMesh.position.set(0, 4.5, 0);
+    this.scene.add(this.keepFlameMesh);
 
     // Point light for flame
-    const flameLight = new THREE.PointLight(0xff6600, 1, 10);
-    flameLight.position.set(0, 4, 0);
-    this.scene.add(flameLight);
+    this.keepFlameLight = new THREE.PointLight(0xff6600, 1, 10);
+    this.keepFlameLight.position.set(0, 4, 0);
+    this.scene.add(this.keepFlameLight);
   }
 
   private createSelectionRing(): void {
@@ -557,6 +561,19 @@ export class GameRenderer {
     if (this.keepMesh) {
       this.scene.remove(this.keepMesh);
       this.disposeObject(this.keepMesh);
+    }
+    // N5：补齐 GridHelper、主堡火焰 mesh/材质、点光的释放
+    if (this.gridHelper) {
+      this.scene.remove(this.gridHelper);
+      this.gridHelper.dispose();
+    }
+    if (this.keepFlameMesh) {
+      this.scene.remove(this.keepFlameMesh);
+      this.disposeObject(this.keepFlameMesh);
+    }
+    if (this.keepFlameLight) {
+      this.scene.remove(this.keepFlameLight);
+      this.keepFlameLight.dispose();
     }
     if (this.selectionRing) {
       this.scene.remove(this.selectionRing);
