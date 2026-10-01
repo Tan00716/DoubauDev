@@ -10,6 +10,7 @@ export class GameUI {
   private hudScreen: HTMLElement | null = null;
   private gameOverScreen: HTMLElement | null = null;
   private settlementScreen: HTMLElement | null = null;
+  private helpOverlay: HTMLElement | null = null;
 
   constructor(renderer: GameRenderer) {
     this.uiLayer = document.getElementById('ui-layer')!;
@@ -49,6 +50,13 @@ export class GameUI {
       .eh-btn-primary:hover { background:#c0392b; transform:scale(1.05); }
       .eh-btn-secondary { background:#34495e; color:#fff; }
       .eh-btn-secondary:hover { background:#2c3e50; }
+      .eh-help-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); display:flex; align-items:center; justify-content:center; z-index:200; }
+      .eh-help-panel { background:linear-gradient(180deg,#1a1a2e 0%,#16213e 100%); border:1px solid #e74c3c; border-radius:12px; padding:28px 36px; max-width:520px; max-height:80vh; overflow-y:auto; box-shadow:0 0 40px rgba(231,76,60,0.3); }
+      .eh-help-panel h2 { color:#e74c3c; font-size:24px; margin:0 0 16px; }
+      .eh-help-panel h3 { color:#f39c12; font-size:16px; margin:14px 0 6px; }
+      .eh-help-panel ul { margin:0; padding-left:20px; }
+      .eh-help-panel li { color:#ddd; font-size:14px; line-height:1.7; }
+      .eh-help-panel .eh-help-goal { color:#fff; font-size:15px; margin:16px 0 0; padding:10px 12px; background:rgba(231,76,60,0.15); border-left:3px solid #e74c3c; border-radius:4px; }
       .eh-hud { position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; }
       .eh-hud > * { pointer-events:auto; }
       .eh-top-bar { display:flex; justify-content:space-between; align-items:center; padding:10px 20px; background:rgba(0,0,0,0.6); }
@@ -133,8 +141,48 @@ export class GameUI {
     };
 
     document.getElementById('btn-help')!.onclick = () => {
-      alert('操作说明：\n\n白天阶段：\n- 点击手牌选择建筑/单位卡，再点击地图放置\n- 点击已放置的班选中，再点击地图移动\n- 点击「入夜」进入夜间防守\n\n夜间阶段：\n- 敌人会从地图边缘进攻\n- 点击战术手牌，再点击地图释放效果\n- 选中己方班后可下达指令\n- 点击「终章」释放指挥官终极技\n\n目标：守住主堡炉火，击败所有进攻的敌人！');
+      this.showHelpPanel();
     };
+  }
+
+  /** S2（质检清理项）：帮助说明由 alert() 改为游戏内面板，避免浏览器原生弹窗打断体验。 */
+  private showHelpPanel(): void {
+    this.closeHelpPanel();
+    const overlay = document.createElement('div');
+    overlay.className = 'eh-help-overlay';
+    overlay.innerHTML = `
+      <div class="eh-help-panel">
+        <h2>操作说明</h2>
+        <h3>白天阶段</h3>
+        <ul>
+          <li>点击手牌选择建筑/单位卡，再点击地图放置</li>
+          <li>点击已放置的班选中，再点击地图移动</li>
+          <li>点击「入夜」进入夜间防守</li>
+        </ul>
+        <h3>夜间阶段</h3>
+        <ul>
+          <li>敌人会从地图边缘进攻</li>
+          <li>点击战术手牌，再点击地图释放效果</li>
+          <li>选中己方班后可下达指令</li>
+          <li>点击「终章」释放指挥官终极技</li>
+        </ul>
+        <p class="eh-help-goal">目标：守住主堡炉火，击败所有进攻的敌人！</p>
+        <button class="eh-btn eh-btn-primary" id="btn-help-close" style="margin-top:20px;">知道了</button>
+      </div>
+    `;
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) this.closeHelpPanel();
+    });
+    this.uiLayer.appendChild(overlay);
+    this.helpOverlay = overlay;
+    document.getElementById('btn-help-close')!.onclick = () => this.closeHelpPanel();
+  }
+
+  private closeHelpPanel(): void {
+    if (this.helpOverlay) {
+      this.helpOverlay.remove();
+      this.helpOverlay = null;
+    }
   }
 
   private showHUD(): void {
