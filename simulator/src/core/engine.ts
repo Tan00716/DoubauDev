@@ -1,50 +1,80 @@
 /**
- * EMBERHOLD Battle Simulation Engine
- * Simplified analytical combat model (no spatial/pathfinding)
+ * EMBERHOLD Battle Simulation Engine v2
+ *
+ * 对齐 game/（commit 37f798f0，M1 修复后）的战斗模型：
+ *
+ *  1. 敌方伤害为事件式固定伤害（B1）：攻击冷却 1.0s 门控，命中 = data.damage，不乘 dt。
+ *     （火圈/灼烧/兵营治疗保留 DPS×dt 语义，与 game 一致。）
+ *  2. 枪卒反冲锋加成并入冷却分支同拍结算（B2）：对 move_speed>3.0 敌人 +50%，
+ *     单枪卒 10s 总输出 = ⌈10/1.3⌉×15（对狼）。
+ *  3. 战意 = 接敌班每秒 0.5（I6），撤退 5 秒封锁；击杀奖励照发（game removeEnemy）。
+ *  4. 盾墙令 0.3 减伤激活：仅作用于敌方对班组的伤害（combat.ts updateEnemies）。
+ *  5. 显式波次结构（I2）：每夜 3 波 + 15s 间隙 + 5s 首波预演；240s 兜底；
+ *     夜末清场（endNight 直接清空残余敌人，无惩罚 —— 与 game 行为一致）。
+ *  6. 军令 6 / 工令 8（I7）；初始军械册 6 张全量（B3）。
+ *  7. 齐射令按实现口径建模（N2）：弓手伤害 ×1.5 + 射程 ×1.3（非攻速）。
+ *  8. 通关判定（I5）：守住第 8 夜 → 胜利；主堡 1000 HP 归零 → 失败。
+ *
+ * 空间简化声明：一维径向模型。敌人从半径 13.5 向主堡推进；
+ * 入场角度差异抽象为 per-enemy 推进速度系数（错峰到达）。
+ * 详见 README「Simplified Battle Model」。
  */
 
 import type {
-  GameState,
-  SquadInstance,
-  BuildingInstance,
-  EnemyInstance,
   PresetConfig,
+  DifficultyVariant,
+  SimSquad,
+  SimBuilding,
+  SimEnemy,
   SingleRunReport,
-  CommanderData,
+  NightStat,
+} from '../types/index.js';
+import {
+  DESIGN_MILITARY_CAPACITY,
+  DESIGN_WORK_CAPACITY,
+  NIGHT_DURATION,
+  TOTAL_WAVES,
+  WAVE_GAP_SECONDS,
+  WAVE_PREVIEW_LEAD_SECONDS,
+  WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC,
+  RETREAT_WAR_SPIRIT_BLOCK_SECONDS,
+  VICTORY_DAYS,
+  WAR_SPIRIT_MAX,
+  MAIN_KEEP_MAX_HEALTH,
+  STARTING_GOLD,
+  ENEMY_ATTACK_COOLDOWN,
+  NIGHT_TACTIC_DRAW_INTERVAL,
+  TACTIC_HAND_SIZE,
+  NIGHT_TACTIC_DRAW_START,
+  GAP_DISCARD_DRAW,
+  MAP_SPAWN_RADIUS,
+  KEEP_ENGAGE_RADIUS,
+  ENEMY_ENGAGE_RADIUS,
+  DAY_SQUAD_HEAL_RATIO,
+  DAY_BUILDING_HEAL_RATIO,
+  WAR_SPIRIT_TO_GOLD_RATE,
+  REPAIR_COST_RATIO,
+  UPGRADE_HP_PER_LEVEL,
+  UPGRADE_MAX_LEVEL,
+  DT,
 } from '../types/index.js';
 import { getUnit } from '../data/units.js';
 import { getBuilding } from '../data/buildings.js';
 import { getEnemy } from '../data/enemies.js';
-import { getCommander } from '../data/commanders.js';
+import { getCard, INITIAL_TACTIC_DECK } from '../data/cards.js';
+import { getVariantWaveComposition, getVariant } from '../data/waves.js';
 import { getPreset } from '../data/presets.js';
-
-// ============ Constants ============
-
-const MAIN_KEEP_MAX_HEALTH = 1000;
-const WAR_SPIRIT_MAX = 40;
-const WAR_SPIRIT_START = 20;
-const GOLD_INCOME_PER_MARKET = 40; // per night (from design doc)
-const SQUAD_UPKEEP = 5; // gold per squad per night
-const TOWER_UPKEEP = 8; // gold per tower per night
-const WALL_UPKEEP = 3; // gold per wall per night
-const RECALL_COST_BASE = 50;
-const RECALL_HEALTH_RATIO = 0.5; // half health on recall
-const EMERGENCY_REINFORCE_MULTIPLIER = 1.5;
-const NIGHT_DURATION_BASE = 120; // seconds base
-const WAVE_GAP_SECONDS = 15;
-const BOSS_TYPE_ENEMIES = ['enemy_shield_crusher', 'enemy_burrower'];
 
 // ============ Seeded RNG ============
 
 export class SeededRNG {
   private seed: number;
   constructor(seed: number) {
-    this.seed = seed;
+    this.seed = seed >>> 0;
   }
   next(): number {
-    // Mulberry32
     this.seed |= 0;
-    this.seed = (this.seed + 0x6D2B79F5) | 0;
+    this.seed = (this.seed + 0x6d2b79f5) | 0;
     let t = Math.imul(this.seed ^ (this.seed >>> 15), 1 | this.seed);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
@@ -55,539 +85,832 @@ export class SeededRNG {
   intRange(min: number, max: number): number {
     return Math.floor(this.range(min, max + 1));
   }
-  choice<T>(arr: T[]): T {
-    return arr[this.intRange(0, arr.length - 1)];
+  shuffle<T>(arr: T[]): T[] {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(this.next() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
   }
 }
 
-// ============ Game State Initialization ============
+// ============ 运行时状态 ============
 
-export function initializeGameState(preset: PresetConfig, seed: number): GameState {
-  const rng = new SeededRNG(seed);
-  const commander = getCommander(preset.commander_id);
+interface RunState {
+  day: number;
+  gold: number;
+  war_spirit: number;
+  military_used: number;
+  work_used: number;
+  keep_health: number;
+  squads: SimSquad[];
+  buildings: SimBuilding[];
+  // 归营堆：card_id -> count（阵亡的军械卡，次日 50% 修复后半血再落阵）
+  damaged_camp: Map<string, number>;
+  // 已修复待落阵（半血入场）—— 对齐 game recalledCards
+  recalled: Set<string>;
+  // 统计
+  military_blocked: number;
+  work_blocked: number;
+  work_blocked_gold_left: number[];
+  upgrades_bought: number;
+  repairs_bought: number;
+  total_casualties: number;
+  total_retreats: number;
+  total_kills: number;
+  gold_curve: number[];
+  night_stats: NightStat[];
+  is_game_over: boolean;
+  victory: boolean;
+  defeat_reason: string | null;
+}
 
-  const squads: SquadInstance[] = preset.initial_squads.map((s, i) => {
-    const unit = getUnit(s.unit_id);
-    return {
-      instance_id: `squad_${i}`,
-      unit_id: s.unit_id,
-      health: unit.max_health,
-      max_health: unit.max_health,
-      position: unit.role === 'archer' ? 'back' : unit.role === 'shield' ? 'front' : 'mid',
-      is_engaged: false,
-      is_retreating: false,
-      retreat_timer: 0,
-      kills_this_night: 0,
-      war_spirit_generated: 0,
-    };
-  });
+interface NightRuntime {
+  timer: number;
+  wave_number: number;
+  wave_active: boolean;
+  gap_timer: number;
+  enemies: SimEnemy[];
+  // 战术手牌（card_id 列表）
+  hand: string[];
+  deck: string[];
+  discard: string[];
+  first_tactic_free: boolean;
+  draws_done: number;
+  // 激活效果
+  shield_wall_timer: number;
+  volley_timer: number;
+  fire_zone: { radius: number; remaining: number } | null;
+  // 反应延迟（策略不完全即时，制造局间方差）
+  tactic_cooldowns: Record<string, number>;
+}
 
-  const buildings: BuildingInstance[] = preset.initial_buildings.map((b, i) => {
-    const bd = getBuilding(b.building_id);
-    return {
-      instance_id: `building_${i}`,
-      building_id: b.building_id,
-      durability: bd.max_durability,
-      max_durability: bd.max_durability,
-      is_destroyed: false,
-    };
-  });
+const TACTIC_IDS = ['card_tactic_fire_oil', 'card_tactic_shield_wall', 'card_tactic_volley', 'card_tactic_rally'];
 
+// ============ 初始化 ============
+
+function initState(): RunState {
   return {
     day: 1,
-    phase: 'day',
-    gold: preset.initial_gold + commander.starting_gold_bonus,
-    war_spirit: WAR_SPIRIT_START,
-    max_war_spirit: WAR_SPIRIT_MAX,
-    military_capacity: commander.starting_military_capacity,
-    work_capacity: commander.starting_work_capacity,
-    main_keep_health: MAIN_KEEP_MAX_HEALTH,
-    max_main_keep_health: MAIN_KEEP_MAX_HEALTH,
-    squads,
-    buildings,
-    damaged_camp: [],
-    deck_armory: [],
-    deck_tactic: [],
-    hand: [],
-    discard_pile: [],
-    cards_played_this_night: 0,
-    total_gold_earned: preset.initial_gold + commander.starting_gold_bonus,
-    total_gold_spent: 0,
-    total_war_spirit_generated: WAR_SPIRIT_START,
-    total_war_spirit_spent: 0,
-    casualties: 0,
-    enemy_kills: 0,
+    gold: STARTING_GOLD,
+    war_spirit: 0,
+    military_used: 0,
+    work_used: 0,
+    keep_health: MAIN_KEEP_MAX_HEALTH,
+    squads: [],
+    buildings: [],
+    damaged_camp: new Map(),
+    recalled: new Set(),
+    military_blocked: 0,
+    work_blocked: 0,
+    work_blocked_gold_left: [],
+    upgrades_bought: 0,
+    repairs_bought: 0,
+    total_casualties: 0,
+    total_retreats: 0,
+    total_kills: 0,
+    gold_curve: [STARTING_GOLD],
+    night_stats: [],
     is_game_over: false,
     victory: false,
     defeat_reason: null,
-    war_spirit_curve: [WAR_SPIRIT_START],
-    gold_curve: [preset.initial_gold + commander.starting_gold_bonus],
   };
 }
 
-// ============ Day Phase ============
+// ============ 伤害公式（与 combat.ts 对齐，抽出为纯函数供单测锁定口径） ============
 
-export function runDayPhase(state: GameState, preset: PresetConfig, rng: SeededRNG): void {
-  state.phase = 'day';
-
-  // 1. Income from markets
-  const marketCount = state.buildings.filter(b => !b.is_destroyed && b.building_id === 'building_market').length;
-  const income = marketCount * GOLD_INCOME_PER_MARKET;
-  state.gold += income;
-  state.total_gold_earned += income;
-
-  // 2. Repair damaged camp units (50% cost to repair to half health)
-  const toRepair = [...state.damaged_camp];
-  state.damaged_camp = [];
-  for (const damaged of toRepair) {
-    const unit = getUnit(damaged.unit_id);
-    const repairCost = Math.floor(unit.military_cost * RECALL_COST_BASE * 0.5);
-    if (state.gold >= repairCost) {
-      state.gold -= repairCost;
-      state.total_gold_spent += repairCost;
-      // Check capacity before adding back
-      const currentMil = state.squads.reduce((sum, s) => sum + getUnit(s.unit_id).military_cost, 0);
-      if (currentMil + unit.military_cost <= state.military_capacity) {
-        state.squads.push({
-          instance_id: `squad_repaired_${rng.next()}`,
-          unit_id: damaged.unit_id,
-          health: Math.floor(unit.max_health * RECALL_HEALTH_RATIO),
-          max_health: unit.max_health,
-          position: 'mid',
-          is_engaged: false,
-          is_retreating: false,
-          retreat_timer: 0,
-          kills_this_night: 0,
-          war_spirit_generated: 0,
-        });
-      }
-      // else: capacity squeeze - unit lost
-    }
-    // else: not enough gold - unit lost
-  }
-
-  // 3. Barracks healing
-  const barracksCount = state.buildings.filter(b => !b.is_destroyed && b.building_id === 'building_barracks').length;
-  if (barracksCount > 0) {
-    for (const squad of state.squads) {
-      const unit = getUnit(squad.unit_id);
-      squad.health = Math.min(squad.max_health, squad.health + Math.floor(unit.max_health * 0.15 * barracksCount));
-    }
-  }
-
-  // 4. Wall slow regen (Viera passive)
-  const commander = getCommander(preset.commander_id);
-  const hasWallRegen = commander.passive_effects.some(e => e.type === 'wall_slow_regen');
-  if (hasWallRegen) {
-    for (const b of state.buildings) {
-      if (!b.is_destroyed && b.building_id === 'building_wall') {
-        b.durability = Math.min(b.max_durability, b.durability + Math.floor(b.max_durability * 0.005));
-      }
-    }
-  }
-
-  // 5. Pay upkeep
-  const upkeep = calculateUpkeep(state);
-  state.gold = Math.max(0, state.gold - upkeep);
-  state.total_gold_spent += upkeep;
-
-  state.gold_curve.push(state.gold);
-}
-
-export function calculateUpkeep(state: GameState): number {
-  let upkeep = 0;
-  for (const b of state.buildings) {
-    if (b.is_destroyed) continue;
-    if (b.building_id === 'building_wall') upkeep += WALL_UPKEEP;
-    else if (b.building_id === 'building_arrow_tower') upkeep += TOWER_UPKEEP;
-    else if (b.building_id === 'building_barracks') upkeep += SQUAD_UPKEEP * 2; // support building
-  }
-  upkeep += state.squads.length * SQUAD_UPKEEP;
-  return upkeep;
-}
-
-// ============ Night Phase ============
-
-export function runNightPhase(state: GameState, preset: PresetConfig, rng: SeededRNG): void {
-  state.phase = 'night';
-  state.war_spirit = Math.min(state.max_war_spirit, state.war_spirit + 5); // night start bonus
-  state.cards_played_this_night = 0;
-  for (const s of state.squads) {
-    s.kills_this_night = 0;
-    s.war_spirit_generated = 0;
-    s.is_retreating = false;
-    s.retreat_timer = 0;
-  }
-
-  const waves = preset.waves[state.day - 1];
-  if (!waves) {
-    // No more waves = victory!
-    state.is_game_over = true;
-    state.victory = true;
-    return;
-  }
-
-  let elapsed = 0;
-  let totalCombatTime = 0;
-  let totalKillTime = 0;
-  let killCount = 0;
-
-  for (let waveIndex = 0; waveIndex < waves.length; waveIndex++) {
-    const wave = waves[waveIndex];
-    elapsed += wave.spawn_delay_seconds;
-
-    // Spawn enemies
-    const enemies: EnemyInstance[] = [];
-    for (const entry of wave.enemies) {
-      for (let i = 0; i < entry.count; i++) {
-        enemies.push({
-          instance_id: `enemy_${waveIndex}_${i}_${rng.next()}`,
-          enemy_id: entry.enemy_id,
-          health: getEnemy(entry.enemy_id).max_health,
-          max_health: getEnemy(entry.enemy_id).max_health,
-          position: 100, // far edge
-        });
-      }
-    }
-
-    // Run combat until all enemies dead or main keep destroyed
-    const result = runWaveCombat(state, enemies, rng);
-    elapsed += result.combat_duration;
-    totalCombatTime += result.combat_duration;
-    totalKillTime += result.total_ttk;
-    killCount += result.kills;
-
-    if (state.is_game_over) break;
-
-    // Wave gap for repairs/tactics
-    elapsed += WAVE_GAP_SECONDS;
-  }
-
-  // Record war spirit at end of night
-  state.war_spirit_curve.push(state.war_spirit);
-}
-
-interface CombatResult {
-  combat_duration: number;
-  kills: number;
-  total_ttk: number;
-}
-
-// ============ Simplified Combat Model ============
 /**
- * SIMPLIFICATION DECLARATION (see README):
- * This is an analytical combat resolver without spatial simulation.
- * It treats combat as aggregate DPS vs HP pools with range-based
- * engagement timing. This means:
- * - No pathfinding or collision avoidance
- * - No individual positioning or kiting
- * - No AOE splash radius calculations
- * - Aggregate approximation of multi-target damage
- *
- * Impact on conclusions:
- * - TTK/TTC estimates are directional, not precise
- * - Build comparisons are valid for aggregate throughput
- * - Micro-intensive builds (游骑劫掠) are underrepresented
- * - Area-effect synergies (缆索塔+轰炮台) are linearized
+ * 班组单击伤害：
+ * - 齐射令：弓手班伤害 ×1.5（N2 实现口径：卡面写攻速+50%，但 combat.ts 实现为伤害×1.5+射程×1.3）；
+ * - 枪卒反冲锋（B2）：对 move_speed > 3.0 的敌人 +50%。
  */
+export function computeSquadHitDamage(unitId: string, targetEnemyId: string, volleyActive: boolean): number {
+  const unit = getUnit(unitId);
+  let dmg = unit.attack_damage * (volleyActive && unitId === 'unit_archer' ? 1.5 : 1);
+  if (unitId === 'unit_pikeman' && getEnemy(targetEnemyId).move_speed > 3.0) {
+    dmg += unit.attack_damage * 0.5;
+  }
+  return dmg;
+}
 
-export function runWaveCombat(state: GameState, enemies: EnemyInstance[], rng: SeededRNG, preset?: PresetConfig): CombatResult {
-  const activePreset = preset ?? getPreset('baseline');
-  const dt = 0.5; // 0.5 second time steps
-  let time = 0;
-  let kills = 0;
-  let totalTtk = 0;
+/**
+ * 敌方事件式单击伤害（B1）：固定伤害、冷却 1.0s 门控。
+ * 盾墙令激活时班组承伤 ×0.7（仅班组 —— 建筑/主堡不受盾墙减免，对齐 combat.ts）。
+ */
+export function computeEnemyHitDamage(enemyId: string, shieldWallActive: boolean, damageMultiplier = 1): number {
+  return getEnemy(enemyId).damage * (shieldWallActive ? 0.7 : 1) * damageMultiplier;
+}
 
-  // Active squads (not retreating, not dead)
-  const activeSquads = () => state.squads.filter(s => s.health > 0 && !s.is_retreating);
-  // Active buildings
-  const activeBuildings = () => state.buildings.filter(b => !b.is_destroyed);
+// ============ 白天阶段：采购 / 修复 / 升级 ============
 
-  while (enemies.some(e => e.health > 0) && state.main_keep_health > 0) {
-    time += dt;
+function unitIdOfCard(cardId: string): string {
+  return cardId.replace('card_unit_', 'unit_');
+}
+function buildingIdOfCard(cardId: string): string {
+  return cardId.replace('card_building_', 'building_');
+}
 
-    // ---- Enemy movement ----
-    for (const enemy of enemies) {
-      if (enemy.health <= 0) continue;
-      const ed = getEnemy(enemy.enemy_id);
-      enemy.position = Math.max(0, enemy.position - ed.move_speed * dt);
-    }
+/** 军械卡 → 径向半径（按预设布局分配） */
+function radiusForSquad(state: RunState, preset: PresetConfig, unitId: string): number {
+  const unit = getUnit(unitId);
+  if (unit.role === 'ranged') return preset.layout.archer_radius;
+  // 前排班由外向内分配（越后买的位置越靠内）
+  const frontCount = state.squads.filter(s => {
+    const u = getUnit(s.unit_id);
+    return u.role === 'front' && !s.is_emergency;
+  }).length;
+  const radii = preset.layout.front_squad_radii;
+  return radii[Math.min(frontCount, radii.length - 1)];
+}
 
-    // ---- Determine targets for enemies ----
-    const aliveEnemies = enemies.filter(e => e.health > 0);
-    const squads = activeSquads();
-    const buildings = activeBuildings();
+function deployUnitCard(state: RunState, preset: PresetConfig, cardId: string, halfHealth: boolean): boolean {
+  const unitId = unitIdOfCard(cardId);
+  const unit = getUnit(unitId);
+  const card = getCard(cardId);
+  if (state.military_used + unit.military_cost > DESIGN_MILITARY_CAPACITY) {
+    state.military_blocked++;
+    return false;
+  }
+  if (state.gold < card.cost_day) return false;
+  state.gold -= card.cost_day;
+  const radius = radiusForSquad(state, preset, unitId);
+  state.squads.push({
+    id: `sq_${state.squads.length}`,
+    unit_id: unitId,
+    health: halfHealth ? Math.floor(unit.max_health * 0.5) : unit.max_health,
+    max_health: unit.max_health,
+    radius,
+    upgrade_level: 0,
+    on_field: true,
+    is_emergency: false,
+    attack_cooldown: 0,
+    war_spirit_block_timer: 0,
+    damage_dealt: 0,
+    attacks: 0,
+    kills: 0,
+  });
+  state.military_used += unit.military_cost;
+  return true;
+}
 
-    // Enemy attacks
-    for (const enemy of aliveEnemies) {
-      const ed = getEnemy(enemy.enemy_id);
-      const attackInterval = 1 / ed.attack_speed;
+function deployBuildingCard(state: RunState, preset: PresetConfig, cardId: string, halfHealth: boolean): boolean {
+  const buildingId = buildingIdOfCard(cardId);
+  const bd = getBuilding(buildingId);
+  const card = getCard(cardId);
+  if (state.work_used + bd.work_cost > DESIGN_WORK_CAPACITY) {
+    state.work_blocked++;
+    state.work_blocked_gold_left.push(state.gold); // 记录"被阻塞时的剩余金币"
+    return false;
+  }
+  if (state.gold < card.cost_day) return false;
+  state.gold -= card.cost_day;
+  const radius =
+    buildingId === 'building_wall' ? preset.layout.wall_radius
+    : buildingId === 'building_arrow_tower' ? preset.layout.tower_radius
+    : preset.layout.barracks_radius;
+  state.buildings.push({
+    id: `b_${state.buildings.length}`,
+    building_id: buildingId,
+    health: halfHealth ? Math.floor(bd.max_durability * 0.5) : bd.max_durability,
+    max_health: bd.max_durability,
+    radius,
+    upgrade_level: 0,
+    destroyed: false,
+    attack_cooldown: 0,
+  });
+  state.work_used += bd.work_cost;
+  return true;
+}
 
-      // Only attack if arrived at target
-      if (enemy.position <= 0) {
-        // Target priority: wall -> squad -> main keep
-        let target: SquadInstance | BuildingInstance | null = null;
-        let targetIsBuilding = false;
+/** 同名牌升级（I3）：仅 +50% maxHP/级 + 回复，M1 无攻击加成（对齐 game applySquadUpgrade）。 */
+function upgradeEntity(state: RunState, cardId: string): boolean {
+  const card = getCard(cardId);
+  if (card.category === 'unit') {
+    const unitId = unitIdOfCard(cardId);
+    const sq = state.squads.find(s => s.unit_id === unitId && !s.is_emergency);
+    if (!sq || sq.upgrade_level >= UPGRADE_MAX_LEVEL) return false;
+    if (state.gold < card.cost_day) return false;
+    state.gold -= card.cost_day;
+    sq.upgrade_level++;
+    const base = getUnit(unitId).max_health;
+    sq.max_health = Math.floor(base * (1 + UPGRADE_HP_PER_LEVEL * sq.upgrade_level));
+    sq.health = Math.min(sq.max_health, sq.health + Math.floor(base * UPGRADE_HP_PER_LEVEL));
+    state.upgrades_bought++;
+    return true;
+  }
+  const buildingId = buildingIdOfCard(cardId);
+  const b = state.buildings.find(x => x.building_id === buildingId && !x.destroyed);
+  if (!b || b.upgrade_level >= UPGRADE_MAX_LEVEL) return false;
+  if (state.gold < card.cost_day) return false;
+  state.gold -= card.cost_day;
+  b.upgrade_level++;
+  const base = getBuilding(buildingId).max_durability;
+  b.max_health = Math.floor(base * (1 + UPGRADE_HP_PER_LEVEL * b.upgrade_level));
+  b.health = Math.min(b.max_health, b.health + Math.floor(base * UPGRADE_HP_PER_LEVEL));
+  state.upgrades_bought++;
+  return true;
+}
 
-        if (ed.target_priority === 'wall') {
-          const walls = buildings.filter(b => b.building_id === 'building_wall');
-          if (walls.length > 0) target = walls[0];
-        } else if (ed.target_priority === 'squad') {
-          if (squads.length > 0) target = squads[Math.floor(rng.next() * squads.length)];
-        } else if (ed.target_priority === 'main_keep') {
-          target = null; // directly hits main keep
-        }
-
-        if (target === null) {
-          // Hit main keep
-          const damage = Math.max(1, ed.damage - 0); // main keep has no armor
-          const variance = 0.85 + rng.next() * 0.3; // ±15% damage variance
-          state.main_keep_health -= damage * dt * ed.attack_speed * variance;
-        } else if ('health' in target && !targetIsBuilding) {
-          // Hit squad
-          const squad = target as SquadInstance;
-          const unit = getUnit(squad.unit_id);
-          const damage = Math.max(1, ed.damage - unit.armor);
-          squad.health -= damage * dt * ed.attack_speed;
-
-          // Generate war spirit from contact
-          if (squad.health > 0) {
-            const wsGen = unit.war_spirit_on_contact * dt;
-            state.war_spirit = Math.min(state.max_war_spirit, state.war_spirit + wsGen);
-            squad.war_spirit_generated += wsGen;
-            state.total_war_spirit_generated += wsGen;
-            squad.is_engaged = true;
-          }
-        } else {
-          // Hit building
-          const b = target as BuildingInstance;
-          const bd = getBuilding(b.building_id);
-          const damage = Math.max(1, ed.damage - bd.armor);
-          b.durability -= damage * dt * ed.attack_speed;
-          if (b.durability <= 0) {
-            b.is_destroyed = true;
-            b.durability = 0;
-          }
-        }
+/**
+ * 白天采购策略（对齐 game 玩家决策的抽象）：
+ * 1. 修复归营堆中且在 build_plan 内的卡（50% cost_day），修复后当天重新落阵（半血，全额 cost_day —— N4 双收费口径，按实现建模）；
+ * 2. 按 build_plan 顺序采购缺失的卡（容量/金币约束下逐项尝试）；
+ * 3. build_plan 全部落阵后按 upgrade_priority 升级（保留 60 金币缓冲）。
+ */
+function runDayPurchases(state: RunState, preset: PresetConfig, rng: SeededRNG): void {
+  // 1. 修复 + 再落阵
+  for (const cardId of [...state.damaged_camp.keys()]) {
+    if (!preset.build_plan.includes(cardId)) continue;
+    const count = state.damaged_camp.get(cardId) ?? 0;
+    for (let i = 0; i < count; i++) {
+      const cost = Math.ceil(getCard(cardId).cost_day * REPAIR_COST_RATIO);
+      if (state.gold < cost) break;
+      state.gold -= cost;
+      state.damaged_camp.set(cardId, (state.damaged_camp.get(cardId) ?? 1) - 1);
+      if ((state.damaged_camp.get(cardId) ?? 0) <= 0) state.damaged_camp.delete(cardId);
+      state.recalled.add(cardId);
+      state.repairs_bought++;
+      // 修复后立即重新落阵（半血、全额 cost_day —— 对齐 game deployArmoryCard/recalledCards）
+      const card = getCard(cardId);
+      if (card.category === 'unit') {
+        deployUnitCard(state, preset, cardId, true);
+      } else {
+        deployBuildingCard(state, preset, cardId, true);
       }
+      state.recalled.delete(cardId);
     }
+  }
 
-    // ---- Squad attacks ----
-    for (const squad of squads) {
-      const unit = getUnit(squad.unit_id);
-      const attackInterval = 1 / unit.attack_speed;
+  // 2. 采购计划（每回合只买"计划内且当前不在场"的卡；一天最多 4 项，模拟玩家注意力）
+  let buys = 0;
+  for (const cardId of preset.build_plan) {
+    if (buys >= 4) break;
+    const card = getCard(cardId);
+    const onField =
+      card.category === 'unit'
+        ? state.squads.some(s => s.unit_id === unitIdOfCard(cardId))
+        : state.buildings.some(b => b.building_id === buildingIdOfCard(cardId));
+    if (onField) continue;
+    if (state.damaged_camp.has(cardId)) continue; // 需先修复（走步骤 1）
+    let ok = false;
+    if (card.category === 'unit') ok = deployUnitCard(state, preset, cardId, false);
+    else ok = deployBuildingCard(state, preset, cardId, false);
+    if (ok) buys++;
+    else if (state.gold < card.cost_day) break; // 没钱则停
+    // 容量阻塞：继续尝试计划中更便宜的项（与玩家行为一致）
+  }
 
-      // Find enemies in range
-      const inRange = aliveEnemies.filter(e => {
-        // Archers can attack from further
-        const effectiveRange = unit.role === 'archer' ? unit.attack_range : unit.attack_range;
-        return e.position <= effectiveRange;
+  // 3. 升级（计划完成后，保留 60 金币缓冲）
+  const planComplete = preset.build_plan.every(cardId => {
+    const card = getCard(cardId);
+    return card.category === 'unit'
+      ? state.squads.some(s => s.unit_id === unitIdOfCard(cardId))
+      : state.buildings.some(b => b.building_id === buildingIdOfCard(cardId));
+  });
+  if (!planComplete) return;
+  let upgrades = 0;
+  for (const cardId of preset.upgrade_priority) {
+    if (upgrades >= 2) break;
+    if (state.gold < getCard(cardId).cost_day + 60) break;
+    if (upgradeEntity(state, cardId)) upgrades++;
+  }
+  void rng; // 预留：采购顺序抖动（当前确定性策略）
+}
+
+// ============ 夜间阶段 ============
+
+function spawnWave(rt: NightRuntime, _state: RunState, day: number, waveNumber: number, variant: DifficultyVariant | null, rng: SeededRNG, hpMult: number): void {
+  rt.wave_number = waveNumber;
+  rt.wave_active = true;
+  const entries = getVariantWaveComposition(day, waveNumber, variant);
+  for (const entry of entries) {
+    const ed = getEnemy(entry.enemyId);
+    for (let i = 0; i < entry.count; i++) {
+      rt.enemies.push({
+        id: `e_${rt.enemies.length}`,
+        enemy_id: entry.enemyId,
+        health: Math.round(ed.max_health * hpMult),
+        max_health: Math.round(ed.max_health * hpMult),
+        dist: MAP_SPAWN_RADIUS * rng.range(0.95, 1.1),
+        // 入场角度差异 → 到达防线时间错峰（同弧度同时出发的抽象）
+        speed_factor: rng.range(0.55, 1.0),
+        attack_cooldown: 0,
       });
+    }
+  }
+}
 
-      if (inRange.length > 0) {
-        // Target closest enemy (simplified targeting)
-        inRange.sort((a, b) => a.position - b.position);
-        const target = inRange[0];
-        const ed = getEnemy(target.enemy_id);
+function drawTactic(rt: NightRuntime, rng: SeededRNG, count: number): void {
+  for (let i = 0; i < count; i++) {
+    if (rt.hand.length >= TACTIC_HAND_SIZE) break;
+    if (rt.deck.length === 0) {
+      if (rt.discard.length === 0) break;
+      rt.deck = rng.shuffle(rt.discard);
+      rt.discard = [];
+    }
+    rt.hand.push(rt.deck.pop()!);
+  }
+}
 
-        // Counterplay bonus
-        let damageMult = 1.0;
-        if (ed.countered_by.includes(squad.unit_id)) damageMult = 1.5;
-        if (squad.unit_id === 'unit_pikeman' && ed.type === 'swarm') damageMult = 1.3;
+/** 战术牌策略（对 game 玩家决策的抽象，含反应延迟制造局间方差）。 */
+function runTacticPolicy(rt: NightRuntime, state: RunState, _preset: PresetConfig, rng: SeededRNG, dt: number): number {
+  let played = 0;
+  for (const id of TACTIC_IDS) {
+    rt.tactic_cooldowns[id] = (rt.tactic_cooldowns[id] ?? 0) - dt;
+  }
+  const fieldSquads = state.squads.filter(s => s.on_field);
+  const frontSquads = fieldSquads.filter(s => getUnit(s.unit_id).role === 'front');
+  const archer = fieldSquads.find(s => s.unit_id === 'unit_archer');
+  const wolvesNear = rt.enemies.filter(e => e.enemy_id === 'enemy_wolf' && e.dist <= 12).length;
+  const engagedEnemies = rt.enemies.filter(e => e.dist <= 12).length;
+  const hurtSquad = fieldSquads.some(s => s.health / s.max_health < 0.7);
 
-        const damage = Math.max(1, unit.attack_damage * damageMult - ed.armor);
-        const variance = 0.9 + rng.next() * 0.2; // ±10% damage variance
-        const actualDamage = damage * dt * unit.attack_speed * variance;
-        target.health -= actualDamage;
+  const tryPlay = (cardId: string, condition: boolean): void => {
+    if (!condition) return;
+    if (rt.tactic_cooldowns[cardId] > 0) return;
+    const idx = rt.hand.indexOf(cardId);
+    if (idx < 0) return;
+    const card = getCard(cardId);
+    let cost = card.cost_night;
+    if (rt.first_tactic_free) {
+      cost = 0;
+      rt.first_tactic_free = false;
+    }
+    if (state.war_spirit < cost) return;
+    state.war_spirit -= cost;
+    rt.hand.splice(idx, 1);
+    rt.discard.push(cardId);
+    // game：打出手牌后立即补抽 1（playTacticCard → drawTacticCards(1)）
+    drawTactic(rt, rng, 1);
+    // 效果
+    if (cardId === 'card_tactic_shield_wall') rt.shield_wall_timer = card.duration;
+    if (cardId === 'card_tactic_volley') rt.volley_timer = card.duration;
+    if (cardId === 'card_tactic_fire_oil') {
+      const frontRadius = frontSquads.length > 0 ? Math.max(...frontSquads.map(s => s.radius)) : 8;
+      rt.fire_zone = { radius: frontRadius, remaining: card.duration };
+    }
+    // 反应延迟：打出后该卡 6±2 秒内不再考虑
+    rt.tactic_cooldowns[cardId] = rng.range(4, 8);
+    played++;
+  };
 
-        if (target.health <= 0) {
-          kills++;
-          totalTtk += time;
-          state.enemy_kills++;
-          // Kill rewards
-          state.war_spirit = Math.min(state.max_war_spirit, state.war_spirit + 2);
-          state.total_war_spirit_generated += 2;
-          squad.kills_this_night++;
+  // 火油：≥3 敌人接近防线
+  tryPlay('card_tactic_fire_oil', engagedEnemies >= 3);
+  // 盾墙：有班接敌且有班掉血 >30%
+  tryPlay('card_tactic_shield_wall', engagedEnemies >= 2 && hurtSquad);
+  // 齐射：弓手在场且 ≥3 狼接近
+  tryPlay('card_tactic_volley', !!archer && wolvesNear >= 3);
+  // 集结号：M1 无战斗效果，不打（保留在手牌占位，与 game 行为一致）
+
+  return played;
+}
+
+function runNight(
+  state: RunState,
+  preset: PresetConfig,
+  variant: DifficultyVariant | null,
+  rng: SeededRNG,
+  dtOverride?: number,
+  targeting: 'nearest' | 'spread' = 'nearest'
+): void {
+  const hpMult = variant?.hp_multiplier ?? 1;
+  const speedMult = variant?.speed_multiplier ?? 1;
+  const rt: NightRuntime = {
+    timer: 0,
+    wave_number: 0,
+    wave_active: false,
+    gap_timer: WAVE_PREVIEW_LEAD_SECONDS,
+    enemies: [],
+    hand: [],
+    deck: rng.shuffle([...INITIAL_TACTIC_DECK]),
+    discard: [],
+    first_tactic_free: true,
+    draws_done: 0,
+    shield_wall_timer: 0,
+    volley_timer: 0,
+    fire_zone: null,
+    tactic_cooldowns: {},
+  };
+  drawTactic(rt, rng, NIGHT_TACTIC_DRAW_START);
+
+  // 当夜统计
+  let idleSeconds = 0;
+  let engagedSeconds = 0;
+  let kills = 0;
+  let squadLosses = 0;
+  let squadRetreats = 0;
+  let tacticsPlayed = 0;
+  let warSpiritGen = 0;
+  let goldEarned = 0;
+  let spawnedTotal = 0;
+
+  const dt = dtOverride ?? DT;
+  const dmgMult = variant?.damage_multiplier ?? 1;
+
+  const spawnWithCount = (waveNumber: number): void => {
+    const before = rt.enemies.length;
+    spawnWave(rt, state, state.day, waveNumber, variant, rng, hpMult);
+    spawnedTotal += rt.enemies.length - before;
+  };
+
+  while (true) {
+    rt.timer += dt;
+
+    // ---- 波次状态机（I2） ----
+    if (!rt.wave_active) {
+      rt.gap_timer -= dt;
+      if (rt.gap_timer <= 0) spawnWithCount(rt.wave_number + 1);
+    }
+    // 夜间每 8s 补抽 1 张
+    const drawsDue = Math.floor(rt.timer / NIGHT_TACTIC_DRAW_INTERVAL);
+    if (drawsDue > rt.draws_done) {
+      rt.draws_done = drawsDue;
+      drawTactic(rt, rng, 1);
+    }
+    // 波次间隙弃 2 抽 2（在波清空转间隙时触发，见下）
+
+    const enemiesAlive = rt.enemies.length > 0;
+    const anyEngaged = state.squads.some(s => {
+      if (!s.on_field) return false;
+      const u = getUnit(s.unit_id);
+      return rt.enemies.some(e => Math.abs(e.dist - s.radius) <= u.attack_range);
+    });
+    if (!enemiesAlive || !anyEngaged) idleSeconds += dt;
+    else engagedSeconds += dt;
+
+    // ---- 敌方回合（B1：事件式固定伤害，冷却 1.0s） ----
+    for (let i = rt.enemies.length - 1; i >= 0; i--) {
+      const en = rt.enemies[i];
+      const ed = getEnemy(en.enemy_id);
+      if (en.attack_cooldown > 0) en.attack_cooldown -= dt;
+
+      // 索敌优先级（combat.ts）：班组(1.5) → 建筑(1.5) → 主堡(2.0)
+      // targeting='nearest'：一维径向默认——所有敌人先遭遇最外层班组（集火，保守下界）
+      // targeting='spread'：对照组——接敌半径内随机选班组（近似 2D 多路径分散承伤）
+      let targetSquad: SimSquad | null = null;
+      let bestS = Infinity;
+      const candidates: SimSquad[] = [];
+      for (const s of state.squads) {
+        if (!s.on_field) continue;
+        const d = Math.abs(en.dist - s.radius);
+        if (d <= ENEMY_ENGAGE_RADIUS && d < bestS) {
+          bestS = d;
+          targetSquad = s;
+        }
+        if (d <= ENEMY_ENGAGE_RADIUS) candidates.push(s);
+      }
+      if (targeting === 'spread' && candidates.length > 1) {
+        targetSquad = candidates[rng.intRange(0, candidates.length - 1)];
+      }
+      if (targetSquad) {
+        if (en.attack_cooldown <= 0) {
+          targetSquad.health -= computeEnemyHitDamage(en.enemy_id, rt.shield_wall_timer > 0, dmgMult);
+          // 冷却补偿：保留本拍提前量，长程攻击节奏精确为 1.0s/次（消除 dt 离散化偏差）
+          en.attack_cooldown += ENEMY_ATTACK_COOLDOWN;
+        }
+        continue; // 已接敌：不再移动
+      }
+
+      let targetBuilding: SimBuilding | null = null;
+      let bestB = Infinity;
+      for (const b of state.buildings) {
+        if (b.destroyed) continue;
+        const d = Math.abs(en.dist - b.radius);
+        if (d <= ENEMY_ENGAGE_RADIUS && d < bestB) {
+          bestB = d;
+          targetBuilding = b;
         }
       }
-    }
-
-    // ---- Building attacks (towers) ----
-    const commanderData = getCommander(activePreset.commander_id);
-    const towerDamagePenalty = commanderData.passive_effects.find(e => e.type === 'tower_damage_penalty')?.params?.multiplier ?? 1.0;
-    for (const b of buildings) {
-      if (b.building_id !== 'building_arrow_tower') continue;
-      const bd = getBuilding(b.building_id);
-      if (!bd.attack_damage) continue;
-
-      const inRange = aliveEnemies.filter(e => e.position <= (bd.attack_range || 0));
-      if (inRange.length > 0) {
-        inRange.sort((a, b) => a.position - b.position);
-        const target = inRange[0];
-        const ed = getEnemy(target.enemy_id);
-        const baseDamage = (bd.attack_damage || 0) * towerDamagePenalty;
-        const damage = Math.max(1, baseDamage - ed.armor);
-        target.health -= damage * dt * (bd.attack_speed || 1);
-
-        if (target.health <= 0) {
-          kills++;
-          totalTtk += time;
-          state.enemy_kills++;
-          state.war_spirit = Math.min(state.max_war_spirit, state.war_spirit + 2);
-          state.total_war_spirit_generated += 2;
-        }
-      }
-    }
-
-    // ---- Retreat check ----
-    for (const squad of state.squads) {
-      if (squad.health <= 0) {
-        if (!squad.is_retreating) {
-          squad.is_retreating = true;
-          state.casualties++;
+      if (targetBuilding) {
+        if (en.attack_cooldown <= 0) {
+          targetBuilding.health -= ed.damage * dmgMult;
+          en.attack_cooldown += ENEMY_ATTACK_COOLDOWN;
+          if (targetBuilding.health <= 0) {
+            targetBuilding.destroyed = true;
+            const bd = getBuilding(targetBuilding.building_id);
+            state.work_used -= bd.work_cost;
+            // 建筑摧毁 → 对应卡入归营堆（I3）
+            const cardId = `card_building_${targetBuilding.building_id.replace('building_', '')}`;
+            state.damaged_camp.set(cardId, (state.damaged_camp.get(cardId) ?? 0) + 1);
+          }
         }
         continue;
       }
-      // Auto-retreat at < 20% health (AI behavior)
-      if (squad.health / squad.max_health < 0.2 && !squad.is_retreating) {
-        squad.is_retreating = true;
-        squad.retreat_timer = 5;
+
+      if (en.dist < KEEP_ENGAGE_RADIUS) {
+        if (en.attack_cooldown <= 0) {
+          state.keep_health -= ed.damage * dmgMult;
+          en.attack_cooldown += ENEMY_ATTACK_COOLDOWN;
+        }
+      } else {
+        en.dist = Math.max(0, en.dist - ed.move_speed * en.speed_factor * speedMult * dt);
       }
-      if (squad.is_retreating) {
-        squad.retreat_timer -= dt;
-        if (squad.retreat_timer <= 0) {
-          squad.health = 0; // retreated off-field
-          if (squad.health <= 0) state.casualties++;
+
+      // ---- 我方班组自动攻击（B2/I6/N2 口径） ----
+      // （放在敌人循环外统一处理，此处只做敌人侧）
+    }
+
+    // ---- 我方班组回合 ----
+    for (let i = state.squads.length - 1; i >= 0; i--) {
+      const sq = state.squads[i];
+      const unit = getUnit(sq.unit_id);
+      if (!sq.on_field) continue;
+
+      if (sq.war_spirit_block_timer > 0) {
+        sq.war_spirit_block_timer = Math.max(0, sq.war_spirit_block_timer - dt);
+      }
+      if (sq.attack_cooldown > 0) sq.attack_cooldown -= dt;
+
+      // 射程（齐射令：弓手射程 ×1.3 —— N2 实现口径）
+      const volleyActive = rt.volley_timer > 0 && sq.unit_id === 'unit_archer';
+      const range = unit.attack_range * (volleyActive ? 1.3 : 1);
+
+      // 索敌：射程内最近敌人
+      let target: SimEnemy | null = null;
+      let bestD = Infinity;
+      for (const en of rt.enemies) {
+        const d = Math.abs(en.dist - sq.radius);
+        if (d <= range && d < bestD) {
+          bestD = d;
+          target = en;
+        }
+      }
+
+      // I6：接敌班每秒 0.5 战意（接敌 = 射程内有敌；撤退封锁期不计）
+      const engaged = !!target && sq.war_spirit_block_timer <= 0;
+      if (engaged) {
+        const gain = WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC * dt;
+        state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + gain);
+        warSpiritGen += gain;
+      }
+
+      if (target && sq.attack_cooldown <= 0) {
+        // 伤害公式见 computeSquadHitDamage：齐射 ×1.5（N2 实现口径）；枪卒反冲锋 +50%（B2）
+        const dmg = computeSquadHitDamage(sq.unit_id, target.enemy_id, volleyActive);
+        target.health -= dmg;
+        sq.damage_dealt += dmg;
+        sq.attacks++;
+        // 冷却补偿：保留本拍提前量，长程攻击节奏精确为 attack_speed 秒/次（⌈t/attack_speed⌉ 口径）
+        sq.attack_cooldown += unit.attack_speed; // game: attackCooldown = attack_speed（秒）
+        if (target.health <= 0) {
+          const ed = getEnemy(target.enemy_id);
+          state.gold += ed.reward_gold;
+          goldEarned += ed.reward_gold;
+          state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + ed.reward_war_spirit);
+          warSpiritGen += ed.reward_war_spirit;
+          state.total_kills++;
+          kills++;
+          sq.kills++;
+          rt.enemies.splice(rt.enemies.indexOf(target), 1);
+        }
+      }
+
+      // 撤退策略（血线以下撤退保卡：离场、5s 战意封锁）
+      if (sq.health / sq.max_health < preset.retreat_threshold) {
+        sq.on_field = false;
+        sq.war_spirit_block_timer = RETREAT_WAR_SPIRIT_BLOCK_SECONDS;
+        squadRetreats++;
+        state.total_retreats++;
+        continue;
+      }
+      // 阵亡：常规班入归营堆（I3），应急增援直接消散
+      if (sq.health <= 0) {
+        if (!sq.is_emergency) {
+          const cardId = `card_unit_${sq.unit_id.replace('unit_', '')}`;
+          state.damaged_camp.set(cardId, (state.damaged_camp.get(cardId) ?? 0) + 1);
+        }
+        state.military_used -= unit.military_cost;
+        state.squads.splice(i, 1);
+        squadLosses++;
+        state.total_casualties++;
+      }
+    }
+
+    // ---- 建筑回合 ----
+    for (const b of state.buildings) {
+      if (b.destroyed) continue;
+      const bd = getBuilding(b.building_id);
+      if (b.attack_cooldown > 0) b.attack_cooldown -= dt;
+      if (b.building_id === 'building_arrow_tower' && b.attack_cooldown <= 0) {
+        let target: SimEnemy | null = null;
+        let bestD = Infinity;
+        for (const en of rt.enemies) {
+          const d = Math.abs(en.dist - b.radius);
+          if (d <= bd.attack_range && d < bestD) {
+            bestD = d;
+            target = en;
+          }
+        }
+        if (target) {
+          target.health -= bd.attack_damage; // 事件式固定伤害
+          b.attack_cooldown += bd.attack_speed;
+          if (target.health <= 0) {
+            const ed = getEnemy(target.enemy_id);
+            state.gold += ed.reward_gold;
+            goldEarned += ed.reward_gold;
+            state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + ed.reward_war_spirit);
+            warSpiritGen += ed.reward_war_spirit;
+            state.total_kills++;
+            kills++;
+            rt.enemies.splice(rt.enemies.indexOf(target), 1);
+          }
+        }
+      }
+      // 兵营治疗（DPS 模型）：半径 4 内的班组每秒 +5
+      if (b.building_id === 'building_barracks') {
+        for (const sq of state.squads) {
+          if (!sq.on_field) continue;
+          if (Math.abs(sq.radius - b.radius) <= bd.heal_radius) {
+            sq.health = Math.min(sq.max_health, sq.health + bd.heals_per_sec * dt);
+          }
         }
       }
     }
 
-    // ---- Check game over ----
-    if (state.main_keep_health <= 0) {
-      state.main_keep_health = 0;
+    // ---- 火圈（DPS 模型，×dt 正确语义） ----
+    if (rt.fire_zone) {
+      rt.fire_zone.remaining -= dt;
+      for (let i = rt.enemies.length - 1; i >= 0; i--) {
+        const en = rt.enemies[i];
+        if (Math.abs(en.dist - rt.fire_zone.radius) <= 3) {
+          en.health -= 15 * dt;
+          if (en.health <= 0) {
+            const ed = getEnemy(en.enemy_id);
+            state.gold += ed.reward_gold;
+            goldEarned += ed.reward_gold;
+            state.war_spirit = Math.min(WAR_SPIRIT_MAX, state.war_spirit + ed.reward_war_spirit);
+            warSpiritGen += ed.reward_war_spirit;
+            state.total_kills++;
+            kills++;
+            rt.enemies.splice(i, 1);
+          }
+        }
+      }
+      if (rt.fire_zone.remaining <= 0) rt.fire_zone = null;
+    }
+
+    // ---- 效果计时 ----
+    if (rt.shield_wall_timer > 0) rt.shield_wall_timer -= dt;
+    if (rt.volley_timer > 0) rt.volley_timer -= dt;
+
+    // ---- 战术策略 ----
+    tacticsPlayed += runTacticPolicy(rt, state, preset, rng, dt);
+
+    // ---- 主堡沦陷判定 ----
+    if (state.keep_health <= 0) {
+      state.keep_health = 0;
       state.is_game_over = true;
       state.defeat_reason = 'main_keep_destroyed';
+      state.night_stats.push({
+        day: state.day,
+        duration: rt.timer,
+        end_reason: 'main_keep_destroyed',
+        idle_seconds: idleSeconds,
+        engaged_seconds: engagedSeconds,
+        enemies_total: spawnedTotal,
+        kills,
+        squad_losses: squadLosses,
+        squad_retreats: squadRetreats,
+        tactic_cards_played: tacticsPlayed,
+        war_spirit_generated: warSpiritGen,
+        gold_earned: goldEarned,
+      });
+      return;
+    }
+
+    // ---- 波次推进 ----
+    if (rt.wave_active && rt.enemies.length === 0) {
+      if (rt.wave_number >= TOTAL_WAVES) {
+        // 第 3 波清空 → 夜结束（cleared）
+        break;
+      }
+      rt.wave_active = false;
+      rt.gap_timer = WAVE_GAP_SECONDS;
+      // 波次间隙弃 2 抽 2
+      const discardCount = Math.min(GAP_DISCARD_DRAW, rt.hand.length);
+      for (let i = 0; i < discardCount; i++) {
+        const idx = rng.intRange(0, rt.hand.length - 1);
+        rt.discard.push(rt.hand.splice(idx, 1)[0]);
+      }
+      drawTactic(rt, rng, GAP_DISCARD_DRAW);
+    }
+
+    // ---- 240s 夜时长兜底（endNight 清场，无惩罚 —— 与 game 一致） ----
+    if (rt.timer >= NIGHT_DURATION) break;
+  }
+
+  // ---- 夜末结算（endNight） ----
+  const endReason: 'cleared' | 'timeout_240s' = rt.wave_active && rt.enemies.length > 0 ? 'timeout_240s' : 'cleared';
+  // 战意全额 50% 折算金币
+  if (state.war_spirit > 0) {
+    const bonus = Math.floor(state.war_spirit * WAR_SPIRIT_TO_GOLD_RATE);
+    state.gold += bonus;
+    goldEarned += bonus;
+    state.war_spirit = 0;
+  }
+  // 撤退班次日回归（保留当前血量，昼间再自愈 20%）；应急增援夜末消散
+  for (const sq of state.squads) {
+    if (!sq.on_field && !sq.is_emergency) sq.on_field = true;
+  }
+  state.squads = state.squads.filter(s => !s.is_emergency);
+
+  state.night_stats.push({
+    day: state.day,
+    duration: rt.timer,
+    end_reason: endReason,
+    idle_seconds: idleSeconds,
+    engaged_seconds: engagedSeconds,
+    enemies_total: spawnedTotal,
+    kills,
+    squad_losses: squadLosses,
+    squad_retreats: squadRetreats,
+    tactic_cards_played: tacticsPlayed,
+    war_spirit_generated: warSpiritGen,
+    gold_earned: goldEarned,
+  });
+  state.gold_curve.push(state.gold);
+}
+
+// ============ 昼间过渡（startNextDay） ============
+
+function runDayTransition(state: RunState): void {
+  for (const b of state.buildings) {
+    if (!b.destroyed) b.health = Math.min(b.max_health, b.health + b.max_health * DAY_BUILDING_HEAL_RATIO);
+  }
+  for (const sq of state.squads) {
+    sq.health = Math.min(sq.max_health, sq.health + sq.max_health * DAY_SQUAD_HEAL_RATIO);
+  }
+  state.day++;
+}
+
+// ============ 单局模拟 ============
+
+export function runSingleSimulation(
+  presetName: string,
+  runId: number,
+  seed: number,
+  variantName: string = 'current',
+  targeting: 'nearest' | 'spread' = 'nearest'
+): SingleRunReport {
+  const preset = getPreset(presetName);
+  const variant = variantName === 'current' ? null : getVariant(variantName);
+  const rng = new SeededRNG(seed);
+  const state = initState();
+
+  // Day 1：白天采购
+  runDayPurchases(state, preset, rng);
+
+  while (!state.is_game_over && state.day <= VICTORY_DAYS) {
+    runNight(state, preset, variant, rng, undefined, targeting);
+    if (state.is_game_over) break;
+
+    if (state.day >= VICTORY_DAYS) {
+      state.victory = true;
+      state.is_game_over = true;
       break;
     }
 
-    // Cap simulation time per wave (prevent infinite loops)
-    if (time > 300) {
-      // If enemies still alive after 5 min, main keep takes attrition damage
-      state.main_keep_health -= 5 * dt;
-    }
+    runDayTransition(state);
+    runDayPurchases(state, preset, rng);
   }
 
-  // Clear engagement flags
-  for (const squad of state.squads) {
-    squad.is_engaged = false;
-  }
-
-  return {
-    combat_duration: time,
-    kills,
-    total_ttk: totalTtk,
-  };
-}
-
-// ============ Night Settlement ============
-
-export function runNightSettlement(state: GameState): void {
-  state.phase = 'settlement';
-
-  // 1. Convert excess war spirit to gold (50% rate)
-  if (state.war_spirit > 0) {
-    const goldFromSpirit = Math.floor(state.war_spirit * 0.5);
-    state.gold += goldFromSpirit;
-    state.total_gold_earned += goldFromSpirit;
-    state.war_spirit = 0;
-  }
-
-  // 2. Dead squads go to damaged camp
-  for (const squad of state.squads) {
-    if (squad.health <= 0) {
-      state.damaged_camp.push({
-        unit_id: squad.unit_id,
-        health: Math.floor(getUnit(squad.unit_id).max_health * 0.3),
-      });
-    }
-  }
-  // Remove dead squads
-  state.squads = state.squads.filter(s => s.health > 0);
-
-  // 3. Rebuild destroyed walls (auto-repair if gold available, 50% cost)
-  for (const b of state.buildings) {
-    if (b.is_destroyed && b.building_id === 'building_wall') {
-      const bd = getBuilding(b.building_id);
-      const rebuildCost = Math.floor(bd.gold_cost * 0.5);
-      if (state.gold >= rebuildCost) {
-        state.gold -= rebuildCost;
-        state.total_gold_spent += rebuildCost;
-        b.is_destroyed = false;
-        b.durability = Math.floor(bd.max_durability * 0.5);
-      }
-    }
-  }
-}
-
-// ============ Full Run ============
-
-export function runSingleSimulation(presetName: string, runId: number, seed: number): SingleRunReport {
-  const preset = getPreset(presetName);
-  const rng = new SeededRNG(seed);
-  const state = initializeGameState(preset, seed);
-
-  const ttcPerDay: number[] = [];
-  const ttkPerDay: number[] = [];
-
-  while (!state.is_game_over && state.day <= preset.max_days) {
-    // Day phase
-    runDayPhase(state, preset, rng);
-
-    // Night phase
-    const startEnemies = countEnemiesInWaves(preset.waves[state.day - 1]);
-    runNightPhase(state, preset, rng);
-
-    if (state.is_game_over) break;
-
-    // Settlement
-    runNightSettlement(state);
-
-    // Record metrics
-    ttcPerDay.push(startEnemies > 0 ? 120 : 0); // placeholder TTC
-    ttkPerDay.push(15); // placeholder average TTK
-
-    state.day++;
-  }
-
-  // Victory: survived all days
-  if (!state.is_game_over && state.day > preset.max_days) {
-    state.is_game_over = true;
+  if (!state.is_game_over) {
     state.victory = true;
+    state.is_game_over = true;
   }
-
-  // Build diversity: count unique unit types
-  const unitTypes = new Set(state.squads.map(s => s.unit_id));
-  const buildDiversity = unitTypes.size;
 
   return {
     run_id: runId,
     preset_name: presetName,
+    variant_name: variantName,
     victory: state.victory,
-    days_survived: state.day - 1,
+    days_survived: state.defeat_reason ? state.day : VICTORY_DAYS,
     defeat_reason: state.defeat_reason,
     final_gold: state.gold,
-    final_main_keep_health: state.main_keep_health,
-    total_casualties: state.casualties,
-    total_enemy_kills: state.enemy_kills,
-    war_spirit_curve: state.war_spirit_curve,
+    final_main_keep_health: state.keep_health,
+    total_casualties: state.total_casualties,
+    total_retreats: state.total_retreats,
+    total_enemy_kills: state.total_kills,
     gold_curve: state.gold_curve,
-    avg_ttc_per_day: ttcPerDay,
-    avg_ttk_per_day: ttkPerDay,
-    build_diversity_score: buildDiversity,
+    night_stats: state.night_stats,
+    military_blocked: state.military_blocked,
+    work_blocked: state.work_blocked,
+    work_blocked_gold_left: state.work_blocked_gold_left,
+    upgrades_bought: state.upgrades_bought,
+    repairs_bought: state.repairs_bought,
   };
 }
 
-function countEnemiesInWaves(waves: { enemies: { enemy_id: string; count: number }[] }[]): number {
-  if (!waves) return 0;
-  return waves.reduce((sum, w) => sum + w.enemies.reduce((s, e) => s + e.count, 0), 0);
-}
+// 导出内部函数供单测使用
+export const _internal = {
+  initState,
+  runDayPurchases,
+  runNight,
+  runDayTransition,
+  deployUnitCard,
+  deployBuildingCard,
+  upgradeEntity,
+  radiusForSquad,
+  SeededRNG,
+};
