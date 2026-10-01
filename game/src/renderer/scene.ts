@@ -9,10 +9,34 @@ export class GameRenderer {
   renderer: THREE.WebGLRenderer;
   container: HTMLElement;
 
-  // Object pools
-  private squadMeshes: Map<string, THREE.Group> = new Map();
+  // MVP 批次一·性能项：InstancedMesh 合批（每类实体一次 drawcall）+ 共享资源 + 帧内零分配
+  // 敌人与班组完全走 InstancedMesh；建筑数量少（≤20）保留独立 Mesh 但 geometry/material 按 buildingId 共享缓存
+  private static readonly MAX_ENEMIES = 256;
+  private static readonly MAX_SQUADS = 64;
+  private static readonly MAX_SQUAD_MEMBERS = 320; // 64 班 × 5 成员上限
+
+  private enemyBodyMesh!: THREE.InstancedMesh;
+  private enemyGlowMesh!: THREE.InstancedMesh;
+  private enemyBarMesh!: THREE.InstancedMesh;
+  private squadBodyMesh!: THREE.InstancedMesh;
+  private squadBarMesh!: THREE.InstancedMesh;
+  private squadSelMesh!: THREE.InstancedMesh;
+
+  // 建筑共享资源缓存（按 buildingId），血条材质因颜色随血量逐建筑变化需 per-entity clone
   private buildingMeshes: Map<string, THREE.Mesh> = new Map();
-  private enemyMeshes: Map<string, THREE.Group> = new Map();
+  private buildingGeometries = new Map<string, THREE.BufferGeometry>();
+  private buildingMaterials = new Map<string, THREE.MeshStandardMaterial>();
+  private buildingBarGeometry!: THREE.PlaneGeometry;
+  private buildingBarMaterialBase!: THREE.MeshBasicMaterial;
+
+  // 帧内复用临时对象（性能项：热路径零分配）
+  private tmpMatrix = new THREE.Matrix4();
+  private tmpQuat = new THREE.Quaternion();
+  private tmpEuler = new THREE.Euler();
+  private tmpVec = new THREE.Vector3();
+  private tmpScale = new THREE.Vector3();
+  private tmpColor = new THREE.Color();
+
   private effectMeshes: THREE.Mesh[] = [];
   // I1：火圈资源复用——共享 geometry/material + 网格池，替代每帧 new CircleGeometry/Material
   private fireZoneGeometry!: THREE.CircleGeometry;
@@ -81,6 +105,7 @@ export class GameRenderer {
     this.createGround();
     this.createMainKeep();
     this.createSelectionRing();
+    this.createInstancedMeshes();
 
     // I1：火圈共享资源初始化
     this.fireZoneGeometry = new THREE.CircleGeometry(1, 32);
@@ -90,6 +115,10 @@ export class GameRenderer {
       opacity: 0.3,
       side: THREE.DoubleSide,
     });
+
+    // 建筑共享资源初始化
+    this.buildingBarGeometry = new THREE.PlaneGeometry(2, 0.15);
+    this.buildingBarMaterialBase = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide });
 
     // Events
     window.addEventListener('resize', () => this.onResize());
@@ -143,6 +172,78 @@ export class GameRenderer {
     this.selectionRing.rotation.x = -Math.PI / 2;
     this.selectionRing.visible = false;
     this.scene.add(this.selectionRing);
+  }
+
+  /**
+   * MVP 批次一·性能项：实体渲染 InstancedMesh 化。
+   * 敌人（body/glow/血条）与班组（成员/血条/选中环）各由固定上限的 InstancedMesh 承载，
+   * drawcall 从「每实体 2~7 个」降为每类 1 个；实例缓冲即天然对象池，实体增删不再触发资源创建/销毁。
+   * 颜色逐实例（instanceColor）：敌人按类型色 + 灼烧橙、班组成员按单位色、班组血条绿→红 HSL。
+   */
+  private createInstancedMeshes(): void {
+    const white = 0xffffff;
+
+    // 敌人主体：单位锥体，per-instance 缩放为 size*0.6 / size*1.2
+    this.enemyBodyMesh = new THREE.InstancedMesh(
+      new THREE.ConeGeometry(1, 1, 6),
+      new THREE.MeshStandardMaterial({ color: white }),
+      GameRenderer.MAX_ENEMIES
+    );
+    this.enemyBodyMesh.castShadow = true;
+    this.enemyBodyMesh.frustumCulled = false;
+
+    // 敌人夜光晕：单位球，per-instance 缩放 size*0.8（灼烧变橙红，透明度统一 0.25）
+    this.enemyGlowMesh = new THREE.InstancedMesh(
+      new THREE.SphereGeometry(1, 8, 8),
+      new THREE.MeshBasicMaterial({ color: white, transparent: true, opacity: 0.25 }),
+      GameRenderer.MAX_ENEMIES
+    );
+    this.enemyGlowMesh.frustumCulled = false;
+
+    // 敌人血条：红色固定，仅缩放长度
+    this.enemyBarMesh = new THREE.InstancedMesh(
+      new THREE.PlaneGeometry(1, 0.1),
+      new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide }),
+      GameRenderer.MAX_ENEMIES
+    );
+    this.enemyBarMesh.frustumCulled = false;
+
+    // 班组成员：固定 box，per-instance 颜色为单位色
+    this.squadBodyMesh = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(0.4, 0.6, 0.4),
+      new THREE.MeshStandardMaterial({ color: white }),
+      GameRenderer.MAX_SQUAD_MEMBERS
+    );
+    this.squadBodyMesh.castShadow = true;
+    this.squadBodyMesh.frustumCulled = false;
+
+    // 班组血条：颜色随血量 HSL（绿→红），长度随比例
+    this.squadBarMesh = new THREE.InstancedMesh(
+      new THREE.PlaneGeometry(1.5, 0.15),
+      new THREE.MeshBasicMaterial({ color: white, side: THREE.DoubleSide }),
+      GameRenderer.MAX_SQUADS
+    );
+    this.squadBarMesh.frustumCulled = false;
+
+    // 班组选中环：黄色固定，未选中时缩放 0 隐藏
+    this.squadSelMesh = new THREE.InstancedMesh(
+      new THREE.RingGeometry(0.8, 0.9, 16),
+      new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide }),
+      GameRenderer.MAX_SQUADS
+    );
+    this.squadSelMesh.frustumCulled = false;
+
+    // 预分配 instanceColor 缓冲（首帧 setColorAt 前必须初始化）
+    const initColor = new THREE.Color(white);
+    for (const mesh of [this.enemyBodyMesh, this.enemyGlowMesh, this.squadBodyMesh, this.squadBarMesh]) {
+      for (let i = 0; i < mesh.count; i++) mesh.setColorAt(i, initColor);
+      mesh.count = 0;
+      this.scene.add(mesh);
+    }
+    for (const mesh of [this.enemyBarMesh, this.squadSelMesh]) {
+      this.scene.add(mesh);
+      mesh.count = 0;
+    }
   }
 
   private onPhaseChange(phase: string): void {
@@ -249,24 +350,17 @@ export class GameRenderer {
     });
   }
 
+  /**
+   * 实体移除钩子：班组/敌人已 InstancedMesh 化，实例缓冲随 gameState 数组自动收缩，无需逐实体清理；
+   * 仅建筑保留独立 Mesh（共享 geometry/material 不 dispose，只释放 per-entity 克隆的血条材质）。
+   */
   private removeEntityMesh(id: string): void {
-    const sq = this.squadMeshes.get(id);
-    if (sq) {
-      this.scene.remove(sq);
-      this.disposeObject(sq);
-      this.squadMeshes.delete(id);
-    }
     const b = this.buildingMeshes.get(id);
     if (b) {
       this.scene.remove(b);
-      this.disposeObject(b);
+      const bar = b.getObjectByName('healthBar') as THREE.Mesh | undefined;
+      if (bar) (bar.material as THREE.MeshBasicMaterial).dispose(); // 克隆材质，per-entity 释放
       this.buildingMeshes.delete(id);
-    }
-    const en = this.enemyMeshes.get(id);
-    if (en) {
-      this.scene.remove(en);
-      this.disposeObject(en);
-      this.enemyMeshes.delete(id);
     }
   }
 
@@ -280,84 +374,59 @@ export class GameRenderer {
     this.renderer.render(this.scene, this.camera);
   }
 
+  /** 班组渲染：成员/血条/选中环三张 InstancedMesh，每帧全量重写实例矩阵（帧内零分配）。 */
   private updateSquadMeshes(): void {
-    const activeIds = new Set<string>();
+    let memberIdx = 0;
+    let squadIdx = 0;
 
     for (const sq of gameState.squads) {
-      activeIds.add(sq.id);
-      let group = this.squadMeshes.get(sq.id);
+      if (squadIdx >= GameRenderer.MAX_SQUADS) break;
       const data = getUnitData(sq.unitId);
       if (!data) continue;
 
-      if (!group) {
-        group = new THREE.Group();
-        const color = new THREE.Color(data.color);
+      // 血条：位置 (x, 1.2, z)，平铺，长度随血量，颜色绿→红
+      const ratio = Math.max(0.01, sq.health / sq.maxHealth);
+      this.tmpEuler.set(-Math.PI / 2, 0, 0);
+      this.tmpQuat.setFromEuler(this.tmpEuler);
+      this.tmpVec.set(sq.position.x, 1.2, sq.position.z);
+      this.tmpScale.set(ratio, 1, 1);
+      this.tmpMatrix.compose(this.tmpVec, this.tmpQuat, this.tmpScale);
+      this.squadBarMesh.setMatrixAt(squadIdx, this.tmpMatrix);
+      this.squadBarMesh.setColorAt(squadIdx, this.tmpColor.setHSL((sq.health / sq.maxHealth) * 0.33, 1, 0.5));
 
-        // Create squad members
-        for (let i = 0; i < data.squad_size; i++) {
-          const geo = new THREE.BoxGeometry(0.4, 0.6, 0.4);
-          const mat = new THREE.MeshStandardMaterial({ color });
-          const mesh = new THREE.Mesh(geo, mat);
-          mesh.castShadow = true;
-          mesh.position.set(
-            sq.visualUnits[i]?.x ?? 0,
-            0.3,
-            sq.visualUnits[i]?.z ?? 0
-          );
-          group.add(mesh);
-        }
+      // 选中环：未选中缩放 0 隐藏
+      this.tmpVec.set(sq.position.x, 0.05, sq.position.z);
+      const selScale = sq.isSelected ? 1 : 0;
+      this.tmpScale.set(selScale, selScale, selScale);
+      this.tmpMatrix.compose(this.tmpVec, this.tmpQuat, this.tmpScale);
+      this.squadSelMesh.setMatrixAt(squadIdx, this.tmpMatrix);
 
-        // Health bar
-        const barGeo = new THREE.PlaneGeometry(1.5, 0.15);
-        const barMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide });
-        const bar = new THREE.Mesh(barGeo, barMat);
-        bar.position.set(0, 1.2, 0);
-        bar.rotation.x = -Math.PI / 2;
-        bar.name = 'healthBar';
-        group.add(bar);
-
-        // Selection indicator
-        const selGeo = new THREE.RingGeometry(0.8, 0.9, 16);
-        const selMat = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide });
-        const sel = new THREE.Mesh(selGeo, selMat);
-        sel.rotation.x = -Math.PI / 2;
-        sel.position.y = 0.05;
-        sel.name = 'selection';
-        sel.visible = false;
-        group.add(sel);
-
-        this.squadMeshes.set(sq.id, group);
-        this.scene.add(group);
+      // 成员：按班组位置 + 编队相对位置
+      this.tmpQuat.identity();
+      this.tmpScale.set(1, 1, 1);
+      for (let m = 0; m < data.squad_size && memberIdx < GameRenderer.MAX_SQUAD_MEMBERS; m++) {
+        const rel = sq.visualUnits[m] ?? { x: 0, z: 0 };
+        this.tmpVec.set(sq.position.x + rel.x, 0.3, sq.position.z + rel.z);
+        this.tmpMatrix.compose(this.tmpVec, this.tmpQuat, this.tmpScale);
+        this.squadBodyMesh.setMatrixAt(memberIdx, this.tmpMatrix);
+        this.squadBodyMesh.setColorAt(memberIdx, this.tmpColor.set(data.color));
+        memberIdx++;
       }
 
-      // Update position
-      group.position.set(sq.position.x, 0, sq.position.z);
-
-      // Update health bar
-      const bar = group.getObjectByName('healthBar') as THREE.Mesh;
-      if (bar) {
-        const ratio = sq.health / sq.maxHealth;
-        (bar.material as THREE.MeshBasicMaterial).color.setHSL(ratio * 0.33, 1, 0.5);
-        bar.scale.x = Math.max(0.01, ratio);
-      }
-
-      // Update selection
-      const sel = group.getObjectByName('selection') as THREE.Mesh;
-      if (sel) {
-        sel.visible = sq.isSelected;
-      }
+      squadIdx++;
     }
 
-    // Remove stale meshes（I1：补 dispose）
-    for (const [id, mesh] of this.squadMeshes) {
-      if (!activeIds.has(id)) {
-        this.scene.remove(mesh);
-        this.disposeObject(mesh);
-        this.squadMeshes.delete(id);
-      }
-    }
+    this.squadBodyMesh.count = memberIdx;
+    this.squadBarMesh.count = squadIdx;
+    this.squadSelMesh.count = squadIdx;
+    this.squadBodyMesh.instanceMatrix.needsUpdate = true;
+    this.squadBarMesh.instanceMatrix.needsUpdate = true;
+    this.squadSelMesh.instanceMatrix.needsUpdate = true;
+    if (this.squadBodyMesh.instanceColor) this.squadBodyMesh.instanceColor.needsUpdate = true;
+    if (this.squadBarMesh.instanceColor) this.squadBarMesh.instanceColor.needsUpdate = true;
   }
 
+  /** 建筑渲染：数量少（≤20）保留独立 Mesh，geometry/material 按 buildingId 共享缓存；血条材质因逐建筑变色保持 clone。 */
   private updateBuildingMeshes(): void {
     const activeIds = new Set<string>();
 
@@ -368,26 +437,30 @@ export class GameRenderer {
       if (!data) continue;
 
       if (!mesh) {
-        const color = new THREE.Color(data.color);
-        let geo: THREE.BufferGeometry;
-
-        if (b.buildingId === 'building_wall') {
-          geo = new THREE.BoxGeometry(1.5, 2, 1.5);
-        } else if (b.buildingId === 'building_arrow_tower') {
-          geo = new THREE.CylinderGeometry(0.6, 0.8, 3, 8);
-        } else {
-          geo = new THREE.BoxGeometry(data.size * 1.5, 2, data.size * 1.5);
+        let geo = this.buildingGeometries.get(b.buildingId);
+        if (!geo) {
+          if (b.buildingId === 'building_wall') {
+            geo = new THREE.BoxGeometry(1.5, 2, 1.5);
+          } else if (b.buildingId === 'building_arrow_tower') {
+            geo = new THREE.CylinderGeometry(0.6, 0.8, 3, 8);
+          } else {
+            geo = new THREE.BoxGeometry(data.size * 1.5, 2, data.size * 1.5);
+          }
+          this.buildingGeometries.set(b.buildingId, geo);
         }
 
-        const mat = new THREE.MeshStandardMaterial({ color });
+        let mat = this.buildingMaterials.get(b.buildingId);
+        if (!mat) {
+          mat = new THREE.MeshStandardMaterial({ color: data.color });
+          this.buildingMaterials.set(b.buildingId, mat);
+        }
+
         mesh = new THREE.Mesh(geo, mat);
         mesh.castShadow = true;
         mesh.receiveShadow = true;
 
-        // Health bar
-        const barGeo = new THREE.PlaneGeometry(2, 0.15);
-        const barMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide });
-        const bar = new THREE.Mesh(barGeo, barMat);
+        // 血条：材质逐建筑 clone（颜色随血量变化），geometry 共享
+        const bar = new THREE.Mesh(this.buildingBarGeometry, this.buildingBarMaterialBase.clone());
         bar.position.set(0, data.size + 0.5, 0);
         bar.rotation.x = -Math.PI / 2;
         bar.name = 'healthBar';
@@ -410,80 +483,60 @@ export class GameRenderer {
     for (const [id, mesh] of this.buildingMeshes) {
       if (!activeIds.has(id)) {
         this.scene.remove(mesh);
-        this.disposeObject(mesh);
+        const bar = mesh.getObjectByName('healthBar') as THREE.Mesh | undefined;
+        if (bar) (bar.material as THREE.MeshBasicMaterial).dispose(); // 克隆材质，per-entity 释放
         this.buildingMeshes.delete(id);
       }
     }
   }
 
+  /** 敌人渲染：body/glow/血条三张 InstancedMesh；朝向主堡（Y 轴旋转），灼烧时 glow 变橙红。 */
   private updateEnemyMeshes(): void {
-    const activeIds = new Set<string>();
+    let idx = 0;
 
     for (const en of gameState.enemies) {
-      activeIds.add(en.id);
-      let group = this.enemyMeshes.get(en.id);
+      if (idx >= GameRenderer.MAX_ENEMIES) break;
       const data = getEnemyData(en.enemyId);
       if (!data) continue;
 
-      if (!group) {
-        group = new THREE.Group();
-        const color = new THREE.Color(data.color);
+      const y = data.size * 0.6;
+      // Y 轴朝向主堡（等价原 group.lookAt(0, y, 0) 的水平分量）
+      this.tmpEuler.set(0, Math.atan2(-en.position.x, -en.position.z), 0);
+      this.tmpQuat.setFromEuler(this.tmpEuler);
 
-        // Enemy body
-        const geo = new THREE.ConeGeometry(data.size * 0.6, data.size * 1.2, 6);
-        const mat = new THREE.MeshStandardMaterial({ color });
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.castShadow = true;
-        group.add(mesh);
+      // 主体锥体：单位几何 + per-instance 缩放
+      this.tmpVec.set(en.position.x, y, en.position.z);
+      this.tmpScale.set(data.size * 0.6, data.size * 1.2, data.size * 0.6);
+      this.tmpMatrix.compose(this.tmpVec, this.tmpQuat, this.tmpScale);
+      this.enemyBodyMesh.setMatrixAt(idx, this.tmpMatrix);
+      this.enemyBodyMesh.setColorAt(idx, this.tmpColor.set(data.color));
 
-        // Glow for night visibility
-        const glowGeo = new THREE.SphereGeometry(data.size * 0.8, 8, 8);
-        const glowMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.2 });
-        const glow = new THREE.Mesh(glowGeo, glowMat);
-        glow.name = 'glow';
-        group.add(glow);
+      // 夜光晕：灼烧橙红 / 平时类型色（透明度统一 0.25，原 0.2/0.5 两档合并为折中值）
+      this.tmpScale.set(data.size * 0.8, data.size * 0.8, data.size * 0.8);
+      this.tmpMatrix.compose(this.tmpVec, this.tmpQuat, this.tmpScale);
+      this.enemyGlowMesh.setMatrixAt(idx, this.tmpMatrix);
+      this.enemyGlowMesh.setColorAt(idx, en.isBurning ? this.tmpColor.set(0xff4400) : this.tmpColor.set(data.color));
 
-        // Health bar
-        const barGeo = new THREE.PlaneGeometry(1, 0.1);
-        const barMat = new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide });
-        const bar = new THREE.Mesh(barGeo, barMat);
-        bar.position.set(0, data.size + 0.5, 0);
-        bar.rotation.x = -Math.PI / 2;
-        bar.name = 'healthBar';
-        group.add(bar);
+      // 血条：红色，平铺，长度随血量
+      const ratio = Math.max(0.01, en.health / en.maxHealth);
+      this.tmpEuler.set(-Math.PI / 2, 0, 0);
+      this.tmpQuat.setFromEuler(this.tmpEuler);
+      this.tmpVec.set(en.position.x, data.size + 0.5, en.position.z);
+      this.tmpScale.set(ratio, 1, 1);
+      this.tmpMatrix.compose(this.tmpVec, this.tmpQuat, this.tmpScale);
+      this.enemyBarMesh.setMatrixAt(idx, this.tmpMatrix);
 
-        this.enemyMeshes.set(en.id, group);
-        this.scene.add(group);
-      }
-
-      group.position.set(en.position.x, data.size * 0.6, en.position.z);
-
-      // Look at main keep
-      group.lookAt(0, data.size * 0.6, 0);
-
-      const bar = group.getObjectByName('healthBar') as THREE.Mesh;
-      if (bar) {
-        const ratio = en.health / en.maxHealth;
-        bar.scale.x = Math.max(0.01, ratio);
-      }
-
-      // Burn effect
-      const glow = group.getObjectByName('glow') as THREE.Mesh;
-      if (glow) {
-        (glow.material as THREE.MeshBasicMaterial).color.set(
-          en.isBurning ? 0xff4400 : new THREE.Color(data.color)
-        );
-        (glow.material as THREE.MeshBasicMaterial).opacity = en.isBurning ? 0.5 : 0.2;
-      }
+      idx++;
     }
 
-    for (const [id, mesh] of this.enemyMeshes) {
-      if (!activeIds.has(id)) {
-        this.scene.remove(mesh);
-        this.disposeObject(mesh);
-        this.enemyMeshes.delete(id);
-      }
-    }
+    this.enemyBodyMesh.count = idx;
+    this.enemyGlowMesh.count = idx;
+    this.enemyBarMesh.count = idx;
+    this.enemyBodyMesh.instanceMatrix.needsUpdate = true;
+    this.enemyGlowMesh.instanceMatrix.needsUpdate = true;
+    this.enemyBarMesh.instanceMatrix.needsUpdate = true;
+    if (this.enemyBodyMesh.instanceColor) this.enemyBodyMesh.instanceColor.needsUpdate = true;
+    if (this.enemyGlowMesh.instanceColor) this.enemyGlowMesh.instanceColor.needsUpdate = true;
   }
 
   private updateEffects(): void {
@@ -542,10 +595,26 @@ export class GameRenderer {
   }
 
   dispose(): void {
-    // I1：完整释放场景资源
-    for (const id of [...this.squadMeshes.keys()]) this.removeEntityMesh(id);
+    // I1 + 批次一：完整释放场景资源
     for (const id of [...this.buildingMeshes.keys()]) this.removeEntityMesh(id);
-    for (const id of [...this.enemyMeshes.keys()]) this.removeEntityMesh(id);
+
+    // InstancedMesh：释放 geometry/material（共享资源统一在此销毁）
+    for (const mesh of [this.enemyBodyMesh, this.enemyGlowMesh, this.enemyBarMesh,
+                        this.squadBodyMesh, this.squadBarMesh, this.squadSelMesh]) {
+      if (!mesh) continue;
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+      mesh.dispose();
+    }
+
+    // 建筑共享缓存
+    for (const geo of this.buildingGeometries.values()) geo.dispose();
+    this.buildingGeometries.clear();
+    for (const mat of this.buildingMaterials.values()) mat.dispose();
+    this.buildingMaterials.clear();
+    this.buildingBarGeometry.dispose();
+    this.buildingBarMaterialBase.dispose();
 
     for (const m of this.activeFireZoneMeshes) this.scene.remove(m);
     for (const m of this.fireZonePool) this.scene.remove(m);
