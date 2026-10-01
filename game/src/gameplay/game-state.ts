@@ -33,6 +33,22 @@ export const STRAGGLER_GAP_FRACTION = 0.5;
 // 战术牌层延迟到第 2 夜开放；引导可跳过，第 2 局起不再出现（runCount 记忆）。
 export const TUTORIAL_WALL_BONUS = 1.5;
 export const RUN_COUNT_STORAGE_KEY = 'emberhold_run_count';
+// ===== MVP 批次三·多路进攻（MVP-AC-07 威胁预演路线显示 / MVP-AC-14 第 3 夜 2 路进攻）=====
+// 出处：设计主文档 rev26「一局 8 昼夜版标准基准」敌军构成行——昼夜 1–2：1–2 路 / 昼夜 3–5：2–3 路 / 昼夜 6–8：3–4 路。
+// 批次三取各区间下限（保守值，QA 校准点）；首夜单路兼服务新手教学聚焦（审计修复项 #8 教学节奏）。
+export function getRouteCountForDay(day: number): number {
+  if (day <= 1) return 1;
+  if (day <= 5) return 2; // 含 MVP-AC-14「第 3 夜 2 路进攻」验收下限
+  return 3;
+}
+/** 本夜进攻路线角（弧度）。确定性（只依赖 day）——读档/重放同夜路线一致，威胁预演与实际进攻一致（MVP-AC-07）。 */
+export function getNightRouteAngles(day: number): number[] {
+  const n = getRouteCountForDay(day);
+  const base = (((day * 1.7) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+  return Array.from({ length: n }, (_, k) => base + (k * Math.PI * 2) / n);
+}
+// 存档版本（技术规格 3.5：版本号 + 自动迁移；不匹配版本拒绝加载）。
+export const SAVE_VERSION = '1.0.0-mvp';
 // 战意：接敌班每秒 0.5；撤退后 5 秒战意封锁（经济系统·战意行）。
 export const WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC = 0.5;
 export const RETREAT_WAR_SPIRIT_BLOCK_SECONDS = 5;
@@ -40,7 +56,7 @@ export const RETREAT_WAR_SPIRIT_BLOCK_SECONDS = 5;
 export const VICTORY_DAYS = 8;
 
 export interface WaveEntry { enemyId: string; count: number; }
-export interface WavePreview { wave: number; eta: number; entries: WaveEntry[]; }
+export interface WavePreview { wave: number; eta: number; entries: WaveEntry[]; routes: number[]; }
 
 /** 显式波次表（I2）：按昼夜数与波次号给出确定的敌人构成，无随机刷怪。 */
 export function getWaveComposition(day: number, wave: number): WaveEntry[] {
@@ -104,6 +120,8 @@ export interface EnemyEntity {
   burnTimer: number;
   speedModifier: number;
   speedModTimer: number;
+  /** 批次三：间隙事件「落单残兵」标记——用于残兵奖励口径旋钮（见 stragglerMode），波次敌人恒为 false。 */
+  isStraggler: boolean;
 }
 
 export interface TacticEffect {
@@ -111,6 +129,44 @@ export interface TacticEffect {
   duration: number;
   params: Record<string, any>;
 }
+
+// ===== MVP 批次三·存档系统（MVP-AC-17；技术规格 3.5 存档粒度 = 昼夜边界）=====
+// 存档载荷只存「可重建的持久状态」：卡牌/单位/建筑按 ID 引用静态数据 + 存动态值（血量/等级/位置），
+// 实体 id、冷却、波次计时等易变字段不入档（读档后重生成/重置），保证任意昼夜边界快照可完整重建。
+export interface SavedSquad {
+  unitId: string; x: number; z: number;
+  health: number; maxHealth: number;
+  upgradeLevel: number; command: SquadEntity['command'];
+}
+export interface SavedBuilding {
+  buildingId: string; x: number; z: number;
+  health: number; maxHealth: number; upgradeLevel: number;
+}
+export interface RunSavePayload {
+  version: string;
+  /** day = 天亮结算后的昼夜边界档；night_pending = 入夜前快照（夜中退出的「本夜开始」回退点）。 */
+  marker: 'day' | 'night_pending';
+  save_time: string;
+  dayCount: number;
+  runCount: number;
+  tutorialDismissed: boolean;
+  gold: number;
+  warSpirit: number;
+  mainKeepHealth: number;
+  squads: SavedSquad[];
+  buildings: SavedBuilding[];
+  armory: { cardId: string; upgrade_level?: number }[];
+  tacticHand: string[];
+  tacticDeck: string[];
+  tacticDiscard: string[];
+  damagedCamp: { cardId: string; count: number }[];
+  recalledPending: [string, number][];
+}
+
+/** 残兵奖励口径旋钮（批次三，模拟器交叉复核发现残兵奖励把三 preset 胜率推到 92–98%，超 40–70% 目标带）。
+ * 产品终裁前的三个候选（模拟器侧研发工程师给出）：① no_reward 纯填充 ② single 减为 1 只 ③ half_reward 奖励减半。
+ * default 维持 v7 现状（全额奖励 2 只/波间）；off 供消融对照。全局校准旋钮，不随 resetGame 复位。 */
+export type StragglerMode = 'default' | 'no_reward' | 'single' | 'half_reward' | 'off';
 
 /**
  * 局数记忆默认实现：浏览器 localStorage；无 DOM 环境（测试/SSR）回退内存（视为第 1 局）。
@@ -183,6 +239,14 @@ export class GameState {
   // ===== 间隙事件「落单残兵」状态（combat.ts 驱动）=====
   stragglerSpawnedThisGap: boolean = false;
   gapTotalSeconds: number = 0;
+  /** 批次三：残兵奖励口径旋钮（产品终裁前 default=v7 现状；详见 StragglerMode 注释）。 */
+  stragglerMode: StragglerMode = 'default';
+
+  // ===== MVP 批次三·多路进攻：本夜进攻路线角（beginNight 按昼夜数确定性生成）=====
+  nightRouteAngles: number[] = [];
+
+  // ===== MVP 批次三·结算收支明细（MVP-AC-12：击杀收益与战意转金分列）=====
+  killGoldThisNight: number = 0;
 
   // ===== 新手第 1 夜引导（批次二）=====
   /** 本局是第几局（1 起）。默认 provider 读 localStorage，测试可注入内存实现。 */
@@ -269,6 +333,9 @@ export class GameState {
     this.gapTotalSeconds = 0;
     this.tutorialDismissed = false;
     this.tutorialBuffApplied = false;
+    // 批次三：多路进攻路线角 / 击杀金币统计复位（stragglerMode 为全局校准旋钮，不在此复位）
+    this.nightRouteAngles = [];
+    this.killGoldThisNight = 0;
 
     // 初始军械册（B3）：6 张全量——3 单位卡 + 3 建筑卡，克隆以携带 upgrade_level 状态
     const initialCards = [
@@ -346,6 +413,10 @@ export class GameState {
     this.goldEarnedThisNight = 0;
     this.squadsLostThisNight = 0;
     this.spiritConvertedLastNight = 0;
+    // 批次三：多路进攻——本夜路线角按昼夜数确定性生成（威胁预演与实际进攻共用同一组路线，MVP-AC-07）；
+    // 击杀金币统计清零（结算收支明细用，MVP-AC-12）。
+    this.nightRouteAngles = getNightRouteAngles(this.dayCount);
+    this.killGoldThisNight = 0;
 
     // 批次二·新手第 1 夜：首夜耐久 +50% 失败保护（主堡 + 城墙；endNight 对称恢复）。
     if (this.isTutorialNight()) {
@@ -448,6 +519,93 @@ export class GameState {
   gameOver(victory: boolean): void {
     this.phase = 'game_over';
     eventBus.emit('game-over', { victory, day: this.dayCount });
+  }
+
+  // ===== 批次三·读档重建（MVP-AC-17；持久化在外层 save-load.ts，此处只负责状态重建）=====
+
+  /**
+   * 从昼夜边界快照重建整局状态（技术规格 3.5：版本不符拒载）。
+   * 重建规则：静态数据（单位/建筑/卡牌属性）按 ID 从 content 层重取，动态值（血量/等级/位置）取档；
+   * 军令/工令占用按实体重算；实体 id、攻击冷却、波次计时等易变字段重新生成/归零
+   * （存档点都在昼夜边界，这些字段本就处于初始态，重建后语义一致）。
+   * 指令降级：依赖目标的指令（move/retreat/focus）目标不入档，统一降级为 hold。
+   */
+  loadFromSave(payload: RunSavePayload): boolean {
+    if (payload.version !== SAVE_VERSION) return false;
+
+    this.resetGame(); // 先回到干净初态（含 6 张军械册 / 5 张战术牌初始牌库，随后按档覆盖）
+
+    this.dayCount = payload.dayCount;
+    this.runCount = payload.runCount;
+    this.tutorialDismissed = payload.tutorialDismissed;
+    this.tutorialBuffApplied = false; // 存档点都在 buff 未生效的边界，入夜时按 runCount/day 重新判定
+    this.gold = payload.gold;
+    this.warSpirit = payload.warSpirit;
+    this.mainKeepHealth = payload.mainKeepHealth;
+
+    // 班组重建：静态数据 + 档内动态值；军令占用重算
+    this.squads = [];
+    this.militaryUsed = 0;
+    for (const s of payload.squads) {
+      const data = getUnitData(s.unitId);
+      if (!data) continue; // 内容版本不一致的脏数据：跳过实体，不整档拒载
+      this.squads.push({
+        id: `squad_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        unitId: s.unitId,
+        position: { x: s.x, z: s.z },
+        health: s.health,
+        maxHealth: s.maxHealth,
+        command: 'hold', // 目标不入档，指令统一降级为驻守（见方法注释）
+        attackCooldown: 0,
+        isSelected: false,
+        upgradeLevel: s.upgradeLevel,
+        isEmergency: false, // 应急班夜末消散，档内不存在
+        warSpiritAccum: 0,
+        warSpiritBlockTimer: 0,
+        visualUnits: this.generateSquadFormation(data.squad_size),
+      });
+      this.militaryUsed += data.military_cost;
+    }
+
+    // 建筑重建：同规则，工令占用重算
+    this.buildings = [];
+    this.workUsed = 0;
+    for (const b of payload.buildings) {
+      const data = getBuildingData(b.buildingId);
+      if (!data) continue;
+      this.buildings.push({
+        id: `building_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        buildingId: b.buildingId,
+        position: { x: b.x, z: b.z },
+        health: b.health,
+        maxHealth: b.maxHealth,
+        attackCooldown: 0,
+        upgradeLevel: b.upgradeLevel,
+      });
+      this.workUsed += data.work_cost;
+    }
+
+    // 军械册：按初始 6 张重建 + 恢复升级等级（upgrade_level 挂在卡实例上）
+    const savedLevels = new Map(payload.armory.map(a => [a.cardId, a.upgrade_level ?? 0]));
+    for (const card of this.armoryDeck) {
+      card.upgrade_level = savedLevels.get(card.card_id) ?? 0;
+    }
+
+    // 战术牌三区重建：按 cardId 从静态表克隆
+    const revive = (ids: string[]): CardData[] =>
+      ids.map(id => getCardData(id)).filter((c): c is CardData => !!c).map(c => ({ ...c }));
+    this.tacticHand = revive(payload.tacticHand);
+    this.tacticDeck = revive(payload.tacticDeck);
+    this.tacticDiscard = revive(payload.tacticDiscard);
+
+    // 受损归营堆 / 已修复待落阵
+    this.damagedCamp = payload.damagedCamp.filter(d => d.count > 0);
+    this.recalledPending = new Map(payload.recalledPending.filter(([cardId]) => !!getCardData(cardId)));
+
+    // 回到白天相位（昼夜边界档的统一恢复点：night_pending = 入夜前的白天态）
+    this.phase = 'day';
+    eventBus.emit('phase-change', { phase: 'day', day: this.dayCount });
+    return true;
   }
 
   // ===== 批次二·新手第 1 夜引导（设计文档审计修复项 #8）=====
@@ -566,7 +724,8 @@ export class GameState {
       this.wavePreview = null;
       return;
     }
-    this.wavePreview = { wave, eta, entries: getWaveComposition(this.dayCount, wave) };
+    // 批次三：预演携带本夜路线角——预演显示的路线与实际进攻路线同源一致（MVP-AC-07）。
+    this.wavePreview = { wave, eta, entries: getWaveComposition(this.dayCount, wave), routes: [...this.nightRouteAngles] };
     eventBus.emit('wave-preview', this.wavePreview);
   }
 
@@ -852,7 +1011,7 @@ export class GameState {
     return true;
   }
 
-  spawnEnemy(enemyId: string, position: Position): void {
+  spawnEnemy(enemyId: string, position: Position, isStraggler: boolean = false): void {
     const data = getEnemyData(enemyId);
     if (!data) return;
 
@@ -868,6 +1027,7 @@ export class GameState {
       burnTimer: 0,
       speedModifier: 1,
       speedModTimer: 0,
+      isStraggler,
     };
 
     this.enemies.push(enemy);
@@ -932,9 +1092,23 @@ export class GameState {
       const en = this.enemies[idx];
       const data = getEnemyData(en.enemyId);
       if (data) {
-        this.addGold(data.reward_gold);
-        this.addWarSpirit(data.reward_war_spirit);
-        this.goldEarnedThisNight += data.reward_gold;
+        // 批次三·残兵奖励口径旋钮（产品终裁前 default=v7 现状全额奖励）：
+        // no_reward=纯填充不给奖励 / half_reward=奖励减半；波次敌人不受旋钮影响。
+        let rewardGold = data.reward_gold;
+        let rewardSpirit = data.reward_war_spirit;
+        if (en.isStraggler) {
+          if (this.stragglerMode === 'no_reward') {
+            rewardGold = 0;
+            rewardSpirit = 0;
+          } else if (this.stragglerMode === 'half_reward') {
+            rewardGold = data.reward_gold / 2;
+            rewardSpirit = data.reward_war_spirit / 2;
+          }
+        }
+        this.addGold(rewardGold);
+        this.addWarSpirit(rewardSpirit);
+        this.goldEarnedThisNight += rewardGold;
+        this.killGoldThisNight += rewardGold;
       }
       this.enemies.splice(idx, 1);
       this.enemiesKilledThisNight++;
