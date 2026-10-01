@@ -97,3 +97,17 @@ src/
 7. **无网络同步** — 纯单机本地运行
 8. **单 chunk 构建** — 产物约 570KB（gzip 后约 145KB），代码分割留 MVP
 9. **帮助弹窗为原生 alert** — 面板化留 MVP
+
+
+## 桌面构建（Electron + Steamworks，批次四新增）
+
+Windows 桌面构建与 Steam 上架打包路线已落地，一条命令出包：
+
+```bash
+npm ci
+npm run electron:build   # 产物：release/Emberhold Setup x.y.z.exe（NSIS）+ .zip 便携版
+```
+
+详见 [electron/README.md](./electron/README.md)（含 CI 自动构建 `.github/workflows/build.yml`、
+Steamworks 成就/云存档集成点与启用步骤、沙箱验证边界声明）。网页构建链路（`npm run dev` /
+`npm test` / `npm run build`）不受影响。
