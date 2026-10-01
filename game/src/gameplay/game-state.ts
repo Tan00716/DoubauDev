@@ -217,7 +217,7 @@ export class GameState {
       .filter((c): c is CardData => !!c)
       .map(c => ({ ...c }));
 
-    // 初始战术牌库（N3：紧急增援入池 4→5 张——召唤物、夜末消散、15 战意）
+    // 初始战术牌库（N3：紧急增援入池 4→5 张——召唤物、夜末消散、7 战意，定价 rev32 终裁）
     const initialTactics = ['card_tactic_fire_oil', 'card_tactic_shield_wall', 'card_tactic_volley', 'card_tactic_rally', 'card_tactic_reinforce'];
     this.tacticDeck = this.shuffleArray(initialTactics
       .map(id => getCardData(id))
