@@ -16,6 +16,9 @@ export type GameEventType =
   | 'game-over'
   | 'commander-ultimate'
   | 'squad-command'
+  | 'wave-preview'
+  | 'entity-upgraded'
+  | 'damaged-camp-changed'
   | 'tick';
 
 export interface GameEvent {
