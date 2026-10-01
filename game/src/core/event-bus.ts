@@ -20,6 +20,7 @@ export type GameEventType =
   | 'entity-upgraded'
   | 'damaged-camp-changed'
   | 'military-changed'
+  | 'tutorial-dismissed'
   | 'tick';
 
 export interface GameEvent {
