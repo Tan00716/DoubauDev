@@ -434,3 +434,124 @@ describe('M1 校准：敌方伤害 ×0.6 落地', () => {
     expect(hpBefore - squad.health).toBe(40);
   });
 });
+
+
+
+describe('应急班夜末消散（批次一裁决：产品定案第 4 条「召唤物、夜末消散」）', () => {
+  it('夜末清算：应急班从场上移除、不入受损归营堆、军令占用释放、次日无残留', () => {
+    setupNightArena();
+    gameState.firstTacticFree = false;
+
+    // 常规盾卫班 + 应急盾卫班同场
+    expect(gameState.spawnSquad('unit_shieldbearer', { x: -3, z: -3 })).toBe(true);
+    const regular = gameState.squads.find(sq => !sq.isEmergency)!;
+    expect(gameState.spawnSquad('unit_shieldbearer', { x: 3, z: 3 }, true)).toBe(true);
+    const emergency = gameState.squads.find(sq => sq.isEmergency)!;
+
+    const cost = getUnitData('unit_shieldbearer')!.military_cost;
+    expect(gameState.militaryUsed).toBe(cost * 2);
+    const usedBefore = gameState.militaryUsed;
+
+    // 夜末清算
+    gameState.endNight();
+    expect(gameState.phase).toBe('night_settlement');
+
+    // 1) 应急班从场上移除，常规班保留
+    expect(gameState.squads.some(sq => sq.id === emergency.id)).toBe(false);
+    expect(gameState.squads.some(sq => sq.id === regular.id)).toBe(true);
+    expect(gameState.squads.every(sq => !sq.isEmergency)).toBe(true);
+
+    // 2) 不入受损归营堆（修复再入场路径对应急班彻底关闭）
+    expect(gameState.damagedCamp.find(d => d.cardId === 'card_unit_shieldbearer')).toBeUndefined();
+    expect(gameState.damagedCamp.length).toBe(0);
+
+    // 3) 不进修复再入场计数（N4 recalledPending）
+    expect(gameState.recalledPending.size).toBe(0);
+
+    // 4) 军令占用随消散释放（记账修复：原 filter 绕过 removeSquad 造成幽灵占用）
+    expect(gameState.militaryUsed).toBe(usedBefore - cost);
+
+    // 5) 次日无残留
+    gameState.startNextDay();
+    expect(gameState.squads.some(sq => sq.id === emergency.id)).toBe(false);
+    expect(gameState.squads.some(sq => sq.id === regular.id)).toBe(true);
+  });
+
+  it('对照：常规班夜末不清场也不入堆（入堆仅发生在阵亡路径）', () => {
+    setupNightArena();
+    gameState.spawnSquad('unit_pikeman', { x: 0, z: 0 });
+    const regular = gameState.squads[0];
+
+    gameState.endNight();
+
+    expect(gameState.squads.some(sq => sq.id === regular.id)).toBe(true);
+    expect(gameState.damagedCamp.length).toBe(0);
+  });
+});
+
+describe('空间网格寻敌一致性（批次一·性能项）', () => {
+  it('网格最近邻查询与暴力全表扫描结果一致（含边界 cell 与 maxRange 语义）', async () => {
+    const { SpatialGrid } = await import('../spatial-grid');
+    type Item = { id: string; position: { x: number; z: number } };
+
+    // 伪随机（固定种子，结果可复现）：撒 200 实体于地图范围
+    let seed = 42;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed / 2147483648;
+    };
+    const items: Item[] = [];
+    const grid = new SpatialGrid<Item>(4, 34);
+    for (let i = 0; i < 200; i++) {
+      const item: Item = { id: `e${i}`, position: { x: rand() * 27 - 13.5, z: rand() * 27 - 13.5 } };
+      items.push(item);
+      grid.insert(item);
+    }
+
+    const brute = (pos: { x: number; z: number }, range: number): Item | null => {
+      let nearest: Item | null = null;
+      let minDist = range;
+      for (const it of items) {
+        const d = Math.hypot(it.position.x - pos.x, it.position.z - pos.z);
+        if (d < minDist) {
+          minDist = d;
+          nearest = it;
+        }
+      }
+      return nearest;
+    };
+
+    // 20 个查询点 × 4 档 range：网格与暴力结果同距（并列时同实体或同距离均可接受）
+    for (let q = 0; q < 20; q++) {
+      const pos = { x: rand() * 27 - 13.5, z: rand() * 27 - 13.5 };
+      for (const range of [1.5, 4, 12, Infinity]) {
+        const byGrid = grid.queryNearest(pos, range);
+        const byBrute = brute(pos, range);
+        if (byBrute === null) {
+          expect(byGrid).toBeNull();
+          continue;
+        }
+        expect(byGrid).not.toBeNull();
+        const dGrid = Math.hypot(byGrid!.position.x - pos.x, byGrid!.position.z - pos.z);
+        const dBrute = Math.hypot(byBrute.position.x - pos.x, byBrute.position.z - pos.z);
+        expect(dGrid).toBeCloseTo(dBrute, 9);
+      }
+    }
+  });
+
+  it('removeById 后查询不再返回已移除实体（与实时数组语义一致）', async () => {
+    const { SpatialGrid } = await import('../spatial-grid');
+    type Item = { id: string; position: { x: number; z: number } };
+    const grid = new SpatialGrid<Item>(4, 34);
+    const a: Item = { id: 'a', position: { x: 0, z: 0 } };
+    const b: Item = { id: 'b', position: { x: 1, z: 0 } };
+    grid.insert(a);
+    grid.insert(b);
+
+    expect(grid.queryNearest({ x: 0, z: 0 }, Infinity)!.id).toBe('a');
+    grid.removeById('a');
+    expect(grid.queryNearest({ x: 0, z: 0 }, Infinity)!.id).toBe('b');
+    grid.removeById('a'); // 幂等：移除不存在的 id 不报错
+    expect(grid.queryNearest({ x: 0, z: 0 }, Infinity)!.id).toBe('b');
+  });
+});
