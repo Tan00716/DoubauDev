@@ -23,6 +23,10 @@ export class GameUI {
     eventBus.on('war-spirit-changed', () => this.updateResources());
     eventBus.on('squad-selected', () => this.updateSquadPanel());
     eventBus.on('card-played', () => this.updateTacticHand());
+    eventBus.on('military-changed', () => {
+      this.updateResources();
+      this.updateTacticHand();
+    });
     eventBus.on('building-placed', () => this.updateArmoryDeck());
     eventBus.on('enemy-spawned', () => this.updateEnemyCount());
     eventBus.on('entity-destroyed', () => this.updateEnemyCount());
@@ -300,8 +304,10 @@ export class GameUI {
       const card = gameState.tacticHand[i];
       const isSelected = gameState.hoveredCardIndex === i;
       const cost = gameState.firstTacticFree && i === 0 ? 0 : card.cost_night;
+      // N1：紧急增援在军令容量满时置灰不可点
+      const playable = gameState.canPlayTacticCard(card);
       html += `
-        <div class="eh-card ${isSelected ? 'eh-card-selected' : ''}" data-index="${i}">
+        <div class="eh-card ${isSelected ? 'eh-card-selected' : ''} ${playable ? '' : 'eh-card-dim'}" data-index="${i}">
           <div class="eh-card-layer eh-layer-tactic">战术</div>
           <div class="eh-card-cost">${cost}意</div>
           <div class="eh-card-name">${card.card_name}</div>
@@ -314,6 +320,13 @@ export class GameUI {
     for (const el of Array.from(panel.querySelectorAll('.eh-card'))) {
       el.addEventListener('click', () => {
         const idx = parseInt((el as HTMLElement).dataset.index!);
+        const card = gameState.tacticHand[idx];
+        if (!card) return;
+        // N1：容量满时拦截点击并提示，不再静默吞卡
+        if (!gameState.canPlayTacticCard(card)) {
+          this.showInfo('军令容量已满，紧急增援无法召唤');
+          return;
+        }
         if (gameState.hoveredCardIndex === idx) {
           // Play the card
           const card = gameState.tacticHand[idx];
