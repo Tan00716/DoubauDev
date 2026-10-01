@@ -418,10 +418,15 @@ export class GameState {
   playTacticCard(handIndex: number, target?: Position): boolean {
     if (handIndex < 0 || handIndex >= this.tacticHand.length) return false;
     const card = this.tacticHand[handIndex];
+
+    // N1 第一道保险：出牌前预检（军令容量满时直接拒绝，UI 同步置灰）
+    if (!this.canPlayTacticCard(card)) return false;
+
     let cost = card.cost_night;
 
     // 指挥官被动：每夜第一张战术牌免费
-    if (this.firstTacticFree && card.layer === 'tactic') {
+    const usedFirstTacticFree = this.firstTacticFree && card.layer === 'tactic';
+    if (usedFirstTacticFree) {
       cost = 0;
       this.firstTacticFree = false;
     }
@@ -431,7 +436,15 @@ export class GameState {
     this.tacticHand.splice(handIndex, 1);
     this.tacticDiscard.push(card);
 
-    this.applyTacticEffect(card, target);
+    // N1 第二道保险（兜底）：效果落空（如竞态下军令容量已满）→ 退款退牌，不静默吞卡
+    if (!this.applyTacticEffect(card, target)) {
+      this.addWarSpirit(cost);
+      if (usedFirstTacticFree) this.firstTacticFree = true;
+      const di = this.tacticDiscard.lastIndexOf(card);
+      if (di >= 0) this.tacticDiscard.splice(di, 1);
+      this.tacticHand.splice(handIndex, 0, card);
+      return false;
+    }
 
     eventBus.emit('card-played', { card, target });
 
@@ -441,7 +454,17 @@ export class GameState {
     return true;
   }
 
-  applyTacticEffect(card: CardData, target?: Position): void {
+  /** N1：战术牌可打出预检——紧急增援需占用军令容量，容量不足时不可出（UI 置灰依据）。 */
+  canPlayTacticCard(card: CardData): boolean {
+    if (card.card_id === 'card_tactic_reinforce') {
+      const data = getUnitData('unit_shieldbearer');
+      if (!data) return false;
+      if (this.militaryUsed + data.military_cost > this.militaryCapacity) return false;
+    }
+    return true;
+  }
+
+  applyTacticEffect(card: CardData, target?: Position): boolean {
     switch (card.card_id) {
       case 'card_tactic_fire_oil':
         if (target) {
@@ -467,10 +490,8 @@ export class GameState {
         });
         break;
       case 'card_tactic_reinforce':
-        if (target) {
-          this.spawnSquad('unit_shieldbearer', target, true);
-        }
-        break;
+        if (!target) return false;
+        return this.spawnSquad('unit_shieldbearer', target, true);
       case 'card_tactic_rally':
         this.activeEffects.push({
           type: 'rally',
@@ -479,6 +500,7 @@ export class GameState {
         });
         break;
     }
+    return true;
   }
 
   useCommanderUltimate(): boolean {
@@ -626,6 +648,7 @@ export class GameState {
 
     this.squads.push(squad);
     this.militaryUsed += data.military_cost;
+    eventBus.emit('military-changed', this.militaryUsed);
     return true;
   }
 
@@ -710,6 +733,7 @@ export class GameState {
       const data = getUnitData(sq.unitId);
       if (data) this.militaryUsed -= data.military_cost;
       this.squads.splice(idx, 1);
+      eventBus.emit('military-changed', this.militaryUsed);
       if (this.selectedSquadId === squadId) {
         this.selectedSquadId = null;
       }
