@@ -429,3 +429,75 @@ describe('放宽变体（校准建议参数）', () => {
     expect(wins / RUNS).toBeLessThan(0.8);
   });
 });
+
+// ============ v2.2 新增：紧急增援入池口径（N3 定案 + N1 修复后行为） ============
+
+describe('紧急增援（近似牌入池，实验开关）', () => {
+  it('默认口径：牌不入池（与 game 当前发布一致），战报夜统计正常', () => {
+    const r = runSingleSimulation('baseline', 0, 20261001);
+    // 默认无应急班：夜末消散逻辑不应产生任何 is_emergency 残留
+    expect(r.night_stats.length).toBeGreaterThanOrEqual(1);
+    expect(r.victory).toBeDefined();
+  });
+
+  it('includeReinforce：入池跑通，局内可产生应急班（或至少不报错）且夜数结构完整', () => {
+    const r = runSingleSimulation('baseline', 0, 20261001, 'current', 'nearest', { includeReinforce: true });
+    for (const ns of r.night_stats) {
+      expect(ns.duration).toBeLessThanOrEqual(240.0001);
+      expect(ns.enemies_total).toBeGreaterThan(0);
+    }
+  });
+
+  it('容量满时策略拒出紧急增援：零战意/零手牌消耗、无应急班产生（N1 修复后口径）', () => {
+    const state = _internal.initState();
+    const preset = getPreset('baseline');
+    const rng = new _internal.SeededRNG(42);
+    // 场上 1 个残血前排班（<40% 触发 frontCrisis）+ 敌接近；军令填满 6/6
+    state.squads.push({
+      id: 'sq_0', unit_id: 'unit_shieldbearer', health: 30, max_health: 120,
+      radius: 10.5, upgrade_level: 0, on_field: true, is_emergency: false,
+      attack_cooldown: 0, war_spirit_block_timer: 0, damage_dealt: 0, attacks: 0, kills: 0,
+    });
+    state.military_used = 6;
+    state.war_spirit = 50;
+    const rt = {
+      timer: 10, wave_number: 1, wave_active: true, gap_timer: 0,
+      enemies: [{ id: 'e0', enemy_id: 'enemy_wolf', health: 30, max_health: 30, dist: 11, speed_factor: 1, attack_cooldown: 0 }],
+      hand: ['card_tactic_reinforce'], deck: [], discard: [],
+      first_tactic_free: false, draws_done: 1,
+      shield_wall_timer: 0, volley_timer: 0, fire_zone: null, tactic_cooldowns: {},
+    } as never;
+    const played = _internal.runTacticPolicy(rt, state, preset, rng, 0.25, { includeReinforce: true });
+    expect(played).toBe(0);                       // 未打出任何牌
+    expect(state.war_spirit).toBe(50);            // 战意零消耗
+    expect((rt as never as { hand: string[] }).hand).toEqual(['card_tactic_reinforce']); // 卡仍在手
+    expect(state.squads).toHaveLength(1);         // 无应急班产生
+  });
+
+  it('容量充足且防线告急时：打出紧急增援，应急盾卫入场、军令+1、扣 15 战意', () => {
+    const state = _internal.initState();
+    const preset = getPreset('baseline');
+    const rng = new _internal.SeededRNG(42);
+    state.squads.push({
+      id: 'sq_0', unit_id: 'unit_shieldbearer', health: 30, max_health: 120,
+      radius: 10.5, upgrade_level: 0, on_field: true, is_emergency: false,
+      attack_cooldown: 0, war_spirit_block_timer: 0, damage_dealt: 0, attacks: 0, kills: 0,
+    });
+    state.military_used = 1;
+    state.war_spirit = 50;
+    const rt = {
+      timer: 10, wave_number: 1, wave_active: true, gap_timer: 0,
+      enemies: [{ id: 'e0', enemy_id: 'enemy_wolf', health: 30, max_health: 30, dist: 11, speed_factor: 1, attack_cooldown: 0 }],
+      hand: ['card_tactic_reinforce'], deck: [], discard: [],
+      first_tactic_free: false, draws_done: 1,
+      shield_wall_timer: 0, volley_timer: 0, fire_zone: null, tactic_cooldowns: {},
+    } as never;
+    const played = _internal.runTacticPolicy(rt, state, preset, rng, 0.25, { includeReinforce: true });
+    expect(played).toBe(1);
+    expect(state.war_spirit).toBe(35);            // 扣 15
+    expect(state.military_used).toBe(2);          // 军令 +1
+    const emg = state.squads.find(s => s.is_emergency);
+    expect(emg).toBeDefined();
+    expect(emg!.health).toBe(120);                // 满血盾卫
+  });
+});
