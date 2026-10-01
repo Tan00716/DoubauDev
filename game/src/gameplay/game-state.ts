@@ -14,10 +14,25 @@ export const DESIGN_WORK_CAPACITY = 8;
 export const NIGHT_DURATION = 240;
 export const NIGHT_TRANSITION_SECONDS = 2.0;
 export const DAY_TRANSITION_SECONDS = 1.5;
-// 波次结构：每夜 1–4 波，M1 固定 3 波；波次间隙 15 秒；入夜首波前 5 秒威胁预演。
+// 波次结构：每夜 1–4 波，M1 固定 3 波；入夜首波前威胁预演。
 export const TOTAL_WAVES = 3;
-export const WAVE_GAP_SECONDS = 15;
-export const WAVE_PREVIEW_LEAD_SECONDS = 5;
+// MVP 批次二·空窗优化（负责人定案指标：夜间空窗率 ≤40%、第 1 夜 ≤50%）：
+// - 预演 15s→… 原节奏为「预演 5s + 波间 15s×2」共 35s 结构性无敌时间，火力充裕的夜空窗率必超标。
+// - 手段（设计文档波次章节授权自由选择）：①压缩空窗段——预演 5s→3s、波间 15s→10s（第 1 夜教学节奏 6s）；
+//   ②加间隙事件——第 2 夜起每个波间过半时确定性刷「落单残兵」（2 只狼，威胁小、计入击杀奖励），
+//   填充间隙后半段使其不再计入空窗；残兵若未被击杀将并入下一波，不干扰波次状态机。
+// - 波次间隙仍是设计文档定义的「唯一可修墙/移位的夜间窗口」，弃 2 抽 2 照常在间隙开始执行。
+export const WAVE_GAP_SECONDS = 10;
+export const NIGHT1_WAVE_GAP_SECONDS = 6;
+export const WAVE_PREVIEW_LEAD_SECONDS = 3;
+export const STRAGGLER_START_DAY = 2;
+export const STRAGGLER_COUNT_PER_GAP = 2;
+export const STRAGGLER_GAP_FRACTION = 0.5;
+// 新手第 1 夜（设计文档·阶段基准表 + 审计修复项 #8）：
+// 分阶段教学（波 1 教班级指令 / 波 2 教战意和打牌 / 波 3 整合）+ 首夜城墙耐久 +50% 失败保护；
+// 战术牌层延迟到第 2 夜开放；引导可跳过，第 2 局起不再出现（runCount 记忆）。
+export const TUTORIAL_WALL_BONUS = 1.5;
+export const RUN_COUNT_STORAGE_KEY = 'emberhold_run_count';
 // 战意：接敌班每秒 0.5；撤退后 5 秒战意封锁（经济系统·战意行）。
 export const WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC = 0.5;
 export const RETREAT_WAR_SPIRIT_BLOCK_SECONDS = 5;
@@ -97,6 +112,32 @@ export interface TacticEffect {
   params: Record<string, any>;
 }
 
+/**
+ * 局数记忆默认实现：浏览器 localStorage；无 DOM 环境（测试/SSR）回退内存（视为第 1 局）。
+ * 「第 2 局起引导不再出现」依赖该计数。
+ */
+const defaultRunCountProvider = {
+  _memory: 0,
+  get(): number {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const raw = localStorage.getItem(RUN_COUNT_STORAGE_KEY);
+        return raw ? parseInt(raw, 10) || 0 : 0;
+      }
+    } catch { /* 隐私模式等 localStorage 不可用时按无记忆处理 */ }
+    return this._memory;
+  },
+  set(n: number): void {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(RUN_COUNT_STORAGE_KEY, String(n));
+        return;
+      }
+    } catch { /* 同上 */ }
+    this._memory = n;
+  },
+};
+
 export class GameState {
   phase: GamePhase = 'menu';
   dayCount: number = 0;
@@ -135,6 +176,23 @@ export class GameState {
   wavePreview: WavePreview | null = null;
   lastTacticDrawAt: number = 0;
 
+  // ===== MVP 批次二·空窗统计（口径：beginNight→endNight 间场上敌人存活数为 0 的累计时长 / 夜总时长）=====
+  idleSecondsThisNight: number = 0;
+  nightIdleHistory: { day: number; idle: number; duration: number }[] = [];
+
+  // ===== 间隙事件「落单残兵」状态（combat.ts 驱动）=====
+  stragglerSpawnedThisGap: boolean = false;
+  gapTotalSeconds: number = 0;
+
+  // ===== 新手第 1 夜引导（批次二）=====
+  /** 本局是第几局（1 起）。默认 provider 读 localStorage，测试可注入内存实现。 */
+  runCount: number = 1;
+  /** 本局内引导已被玩家主动跳过（跳过=关闭整局新手模式：提示/战术牌锁定/耐久保护一并失效）。 */
+  tutorialDismissed: boolean = false;
+  /** 首夜耐久 +50% 已生效标记（endNight 按此对称恢复，与 tutorialDismissed 解耦防越界）。 */
+  tutorialBuffApplied: boolean = false;
+  private runCountProvider: { get(): number; set(n: number): void } = defaultRunCountProvider;
+
   // 阶段过渡计时（I4）：由 update(dt) 驱动，不再使用 setTimeout
   phaseTimer: number = 0;
 
@@ -171,6 +229,9 @@ export class GameState {
     this.gold = 500;
     this.warSpirit = 0;
     this.mainKeepHealth = 1000;
+    // 批次二修复：maxHealth 此前从不重置——首夜耐久保护（×1.5）生效后若玩家中途 game over
+    // 或跳过引导后直接重开一局，新局会带着 1500 上限开局（跨局状态泄漏）。与 health 同步重置。
+    this.mainKeepMaxHealth = 1000;
     this.militaryUsed = 0;
     this.workUsed = 0;
     this.squads = [];
@@ -202,6 +263,12 @@ export class GameState {
     this.goldEarnedThisNight = 0;
     this.squadsLostThisNight = 0;
     this.spiritConvertedLastNight = 0;
+    // 批次二：空窗统计 / 残兵标记 / 引导跳过状态复位（夜间跳过引导只在当局内生效，跨局重置）
+    this.idleSecondsThisNight = 0;
+    this.stragglerSpawnedThisGap = false;
+    this.gapTotalSeconds = 0;
+    this.tutorialDismissed = false;
+    this.tutorialBuffApplied = false;
 
     // 初始军械册（B3）：6 张全量——3 单位卡 + 3 建筑卡，克隆以携带 upgrade_level 状态
     const initialCards = [
@@ -227,6 +294,10 @@ export class GameState {
 
   startGame(): void {
     this.resetGame();
+    // 批次二·局数记忆：每局开始计数 +1 并持久化——第 1 局（runCount===1）激活新手第 1 夜引导，
+    // 第 2 局起不再出现（设计文档审计修复项 #8「可跳过的引导」口径）。
+    this.runCount = this.runCountProvider.get() + 1;
+    this.runCountProvider.set(this.runCount);
     this.phase = 'day';
     eventBus.emit('phase-change', { phase: 'day', day: this.dayCount });
   }
@@ -264,8 +335,11 @@ export class GameState {
     this.waveNumber = 0;
     this.waveTimer = 0;
     this.gapTimer = WAVE_PREVIEW_LEAD_SECONDS; // 首波抵达前的威胁预演窗口
+    this.gapTotalSeconds = WAVE_PREVIEW_LEAD_SECONDS;
+    this.stragglerSpawnedThisGap = false;
     this.nightTimer = 0;
     this.lastTacticDrawAt = 0;
+    this.idleSecondsThisNight = 0;
     this.commanderUltimateUsedThisNight = false;
     this.firstTacticFree = true;
     this.enemiesKilledThisNight = 0;
@@ -273,8 +347,15 @@ export class GameState {
     this.squadsLostThisNight = 0;
     this.spiritConvertedLastNight = 0;
 
-    // 抽初始战术手牌
-    this.drawTacticCards(3);
+    // 批次二·新手第 1 夜：首夜耐久 +50% 失败保护（主堡 + 城墙；endNight 对称恢复）。
+    if (this.isTutorialNight()) {
+      this.applyTutorialWallBonus();
+    }
+
+    // 抽初始战术手牌（新手第 1 夜锁定战术牌层，延迟到第 2 夜开放）
+    if (!this.isTutorialNight()) {
+      this.drawTacticCards(3);
+    }
 
     eventBus.emit('phase-change', { phase: 'night', day: this.dayCount });
     this.setWavePreview(1, this.gapTimer);
@@ -285,6 +366,19 @@ export class GameState {
     this.phase = 'night_settlement';
     this.waveActive = false;
     this.wavePreview = null;
+
+    // 批次二：记录本夜空窗数据（供模拟器口径复核 / 测试断言 / 结算页展示）。
+    this.nightIdleHistory.push({
+      day: this.dayCount,
+      idle: Math.round(this.idleSecondsThisNight * 100) / 100,
+      duration: Math.round(this.nightTimer * 100) / 100,
+    });
+
+    // 批次二·新手第 1 夜：恢复耐久保护（按生效标记对称恢复，与 isTutorialNight 解耦——
+    // 玩家夜间跳过引导后 buff 仍保持到夜末，避免结算瞬间耐久跳变导致意外失守）。
+    if (this.tutorialBuffApplied) {
+      this.removeTutorialWallBonus();
+    }
 
     // 清场残余敌人
     this.enemies = [];
@@ -356,6 +450,62 @@ export class GameState {
     eventBus.emit('game-over', { victory, day: this.dayCount });
   }
 
+  // ===== 批次二·新手第 1 夜引导（设计文档审计修复项 #8）=====
+
+  /** 局数记忆注入（测试用）：传入内存 provider 以隔离 localStorage。 */
+  setRunCountProvider(provider: { get(): number; set(n: number): void }): void {
+    this.runCountProvider = provider;
+  }
+
+  /**
+   * 新手引导夜判定：第 1 局（runCount===1）的第 1 夜且未被跳过。
+   * 跳过 = 关闭整局新手模式（教学提示 / 战术牌锁定 / 耐久保护一并失效）；
+   * 第 2 局起 runCount>1，引导不再出现。
+   */
+  isTutorialNight(): boolean {
+    return this.runCount === 1 && this.dayCount === 1 && this.phase === 'night' && !this.tutorialDismissed;
+  }
+
+  /** 引导第 1 夜也适用（过渡/结算阶段查询时 phase 已不是 night，故另设宽判定）。 */
+  isTutorialRun(): boolean {
+    return this.runCount === 1 && !this.tutorialDismissed;
+  }
+
+  /** 玩家点击「跳过引导」（UI 调用）。 */
+  dismissTutorial(): void {
+    this.tutorialDismissed = true;
+    eventBus.emit('tutorial-dismissed', {});
+  }
+
+  /** 首夜耐久 +50% 失败保护：主堡 + 城墙类建筑当前/上限耐久同步 ×1.5（审计修复项 #8）。 */
+  private applyTutorialWallBonus(): void {
+    this.mainKeepMaxHealth = Math.round(this.mainKeepMaxHealth * TUTORIAL_WALL_BONUS);
+    this.mainKeepHealth = Math.round(this.mainKeepHealth * TUTORIAL_WALL_BONUS);
+    for (const b of this.buildings) {
+      if (b.buildingId === 'building_wall') {
+        b.maxHealth = Math.round(b.maxHealth * TUTORIAL_WALL_BONUS);
+        b.health = Math.round(b.health * TUTORIAL_WALL_BONUS);
+      }
+    }
+    this.tutorialBuffApplied = true;
+  }
+
+  /** 夜末对称恢复：÷1.5 后钳制回原上限，耐久按同比例回落（保住已损失量，不白嫖修复）。 */
+  private removeTutorialWallBonus(): void {
+    this.mainKeepMaxHealth = Math.round(this.mainKeepMaxHealth / TUTORIAL_WALL_BONUS);
+    this.mainKeepHealth = Math.min(
+      this.mainKeepMaxHealth,
+      Math.round(this.mainKeepHealth / TUTORIAL_WALL_BONUS),
+    );
+    for (const b of this.buildings) {
+      if (b.buildingId === 'building_wall') {
+        b.maxHealth = Math.round(b.maxHealth / TUTORIAL_WALL_BONUS);
+        b.health = Math.min(b.maxHealth, Math.round(b.health / TUTORIAL_WALL_BONUS));
+      }
+    }
+    this.tutorialBuffApplied = false;
+  }
+
   addGold(amount: number): void {
     this.gold = Math.max(0, this.gold + amount);
     eventBus.emit('gold-changed', this.gold);
@@ -387,6 +537,9 @@ export class GameState {
   }
 
   drawTacticCards(count: number): void {
+    // 批次二·新手第 1 夜锁定战术牌层（审计修复项 #8：战术牌延迟到第 2 夜开放）。
+    // 统一在入口守卫，覆盖夜间 8 秒补抽 / 间隙弃 2 抽 2 / 终章抽 3 / 出牌补抽全部路径。
+    if (this.isTutorialNight()) return;
     for (let i = 0; i < count; i++) {
       if (this.tacticHand.length >= 5) break;
       if (this.tacticDeck.length === 0) {
@@ -462,6 +615,8 @@ export class GameState {
 
   /** N1：战术牌可打出预检——紧急增援需占用军令容量，容量不足时不可出（UI 置灰依据）。 */
   canPlayTacticCard(card: CardData): boolean {
+    // 批次二·新手第 1 夜：战术牌层整体锁定（正常路径下无手牌，此处为竞态兜底）。
+    if (this.isTutorialNight()) return false;
     if (card.card_id === 'card_tactic_reinforce') {
       const data = getUnitData('unit_shieldbearer');
       if (!data) return false;
@@ -514,6 +669,8 @@ export class GameState {
   useCommanderUltimate(): boolean {
     if (this.commanderUltimateUsedThisNight) return false;
     if (this.phase !== 'night') return false;
+    // 批次二·新手第 1 夜：终章是战术牌引擎（抽 3），随战术牌层一并锁定到第 2 夜。
+    if (this.isTutorialNight()) return false;
 
     this.commanderUltimateUsedThisNight = true;
     this.drawTacticCards(3);
