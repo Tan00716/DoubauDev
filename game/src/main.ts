@@ -2,6 +2,7 @@ import { GameRenderer } from './renderer/scene';
 import { GameUI } from './ui/ui';
 import { gameState } from './gameplay/game-state';
 import { updateCombat } from './gameplay/combat';
+import { initSaveAutoHooks } from './gameplay/save-load';
 import { eventBus } from './core/event-bus';
 
 class Game {
@@ -14,6 +15,8 @@ class Game {
     this.renderer = new GameRenderer('canvas-container');
     // S6：UI 依赖通过构造注入，不再挂 window.gameRenderer 全局
     this.ui = new GameUI(this.renderer);
+    // 批次三（MVP-AC-17）：自动存档钩子——入夜前 night_pending 快照 / 天亮结算后 day 档 / 局终清档
+    initSaveAutoHooks(gameState);
     this.running = true;
     this.lastTime = performance.now();
     requestAnimationFrame((t) => this.loop(t));
