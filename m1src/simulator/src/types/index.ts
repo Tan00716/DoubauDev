@@ -12,8 +12,12 @@ export const DESIGN_MILITARY_CAPACITY = 6; // 军令容量
 export const DESIGN_WORK_CAPACITY = 8; // 工令容量
 export const NIGHT_DURATION = 240; // 夜时长（秒，兜底）
 export const TOTAL_WAVES = 3; // 每夜波数
-export const WAVE_GAP_SECONDS = 15; // 波次间隙
-export const WAVE_PREVIEW_LEAD_SECONDS = 5; // 首波威胁预演
+export const WAVE_GAP_SECONDS = 10; // 波次间隙（批次二：15→10，对齐 game v7）
+export const NIGHT1_WAVE_GAP_SECONDS = 6; // 第 1 夜教学节奏波间（批次二）
+export const WAVE_PREVIEW_LEAD_SECONDS = 3; // 首波威胁预演（批次二：5→3）
+export const STRAGGLER_START_DAY = 2; // 落单残兵起始夜（批次二）
+export const STRAGGLER_COUNT_PER_GAP = 2; // 每个波间刷 2 只狼（批次二）
+export const STRAGGLER_GAP_FRACTION = 0.5; // 波间过半触发（批次二）
 export const WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC = 0.5; // 接敌班每秒战意
 export const RETREAT_WAR_SPIRIT_BLOCK_SECONDS = 5; // 撤退战意封锁
 export const VICTORY_DAYS = 8; // 通关昼夜数
@@ -179,6 +183,7 @@ export interface NightStat {
   duration: number; // 实际夜时长
   end_reason: 'cleared' | 'timeout_240s' | 'main_keep_destroyed';
   idle_seconds: number; // 无敌人存活/接敌的空窗秒数（含预演+间隙）
+  empty_field_seconds: number; // 场上敌人为 0 的累计秒数（game 批次二空窗口径，含预演+间隙）
   engaged_seconds: number; // 至少一个班接敌的秒数
   enemies_total: number;
   kills: number;
