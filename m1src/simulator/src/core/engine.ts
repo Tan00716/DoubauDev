@@ -35,7 +35,11 @@ import {
   NIGHT_DURATION,
   TOTAL_WAVES,
   WAVE_GAP_SECONDS,
+  NIGHT1_WAVE_GAP_SECONDS,
   WAVE_PREVIEW_LEAD_SECONDS,
+  STRAGGLER_START_DAY,
+  STRAGGLER_COUNT_PER_GAP,
+  STRAGGLER_GAP_FRACTION,
   WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC,
   RETREAT_WAR_SPIRIT_BLOCK_SECONDS,
   VICTORY_DAYS,
@@ -136,6 +140,9 @@ interface NightRuntime {
   wave_number: number;
   wave_active: boolean;
   gap_timer: number;
+  // 批次二·残兵事件状态（对齐 game combat.ts checkWaveProgress）
+  gap_total: number;
+  straggler_spawned: boolean;
   enemies: SimEnemy[];
   // 战术手牌（card_id 列表）
   hand: string[];
@@ -438,6 +445,8 @@ interface NightOptions extends ReinforceExperimentOptions {
   reinforceInDeckOnly?: boolean;
   /** 诊断用：收紧增援打出条件——仅「前排全残/无前排」真正崩线才打。 */
   reinforceSmart?: boolean;
+  /** 诊断用：关闭落单残兵（校准带纯节奏口径锁定）。 */
+  stragglerOff?: boolean;
 }
 
 /** 战术牌策略（对 game 玩家决策的抽象，含反应延迟制造局间方差）。 */
@@ -564,6 +573,8 @@ function runNight(
     wave_number: 0,
     wave_active: false,
     gap_timer: WAVE_PREVIEW_LEAD_SECONDS,
+    gap_total: WAVE_PREVIEW_LEAD_SECONDS,
+    straggler_spawned: false,
     enemies: [],
     hand: [],
     deck: rng.shuffle(options?.includeReinforce || options?.reinforceInDeckOnly
@@ -582,6 +593,7 @@ function runNight(
 
   // 当夜统计
   let idleSeconds = 0;
+  let emptyFieldSeconds = 0;
   let engagedSeconds = 0;
   let kills = 0;
   let squadLosses = 0;
@@ -606,6 +618,31 @@ function runNight(
     // ---- 波次状态机（I2） ----
     if (!rt.wave_active) {
       rt.gap_timer -= dt;
+      // 批次二·落单残兵：第 2 夜起每个波间过半时确定性刷 2 只狼（基础 HP，不带变体 hpMult——game 无变体机制），
+      // 填充空窗后半段；不改波次状态机，未杀残兵并入下一波（本就存于 rt.enemies）。
+      if (
+        !rt.straggler_spawned &&
+        !options?.stragglerOff &&
+        state.day >= STRAGGLER_START_DAY &&
+        rt.wave_number >= 1 &&
+        rt.gap_total > 0 &&
+        rt.gap_timer <= rt.gap_total * (1 - STRAGGLER_GAP_FRACTION)
+      ) {
+        rt.straggler_spawned = true;
+        const sd = getEnemy('enemy_wolf');
+        for (let i = 0; i < STRAGGLER_COUNT_PER_GAP; i++) {
+          rt.enemies.push({
+            id: `e_${rt.enemies.length}`,
+            enemy_id: 'enemy_wolf',
+            health: sd.max_health,
+            max_health: sd.max_health,
+            dist: MAP_SPAWN_RADIUS * rng.range(0.95, 1.1),
+            speed_factor: rng.range(0.55, 1.0),
+            attack_cooldown: 0,
+          });
+          spawnedTotal += 1;
+        }
+      }
       if (rt.gap_timer <= 0) spawnWithCount(rt.wave_number + 1);
     }
     // 夜间每 8s 补抽 1 张
@@ -624,6 +661,8 @@ function runNight(
     });
     if (!enemiesAlive || !anyEngaged) idleSeconds += dt;
     else engagedSeconds += dt;
+    // game 批次二空窗口径：场上敌人为 0 的累计时长（含预演与波间前半段）
+    if (rt.enemies.length === 0) emptyFieldSeconds += dt;
 
     // ---- 敌方回合（B1：事件式固定伤害，冷却 1.0s） ----
     for (let i = rt.enemies.length - 1; i >= 0; i--) {
@@ -857,6 +896,7 @@ function runNight(
         duration: rt.timer,
         end_reason: 'main_keep_destroyed',
         idle_seconds: idleSeconds,
+        empty_field_seconds: emptyFieldSeconds,
         engaged_seconds: engagedSeconds,
         enemies_total: spawnedTotal,
         kills,
@@ -876,7 +916,11 @@ function runNight(
         break;
       }
       rt.wave_active = false;
-      rt.gap_timer = WAVE_GAP_SECONDS;
+      // 批次二：波间 10s；第 1 夜教学节奏 6s（对齐 game）
+      const gapSeconds = state.day === 1 ? NIGHT1_WAVE_GAP_SECONDS : WAVE_GAP_SECONDS;
+      rt.gap_timer = gapSeconds;
+      rt.gap_total = gapSeconds;
+      rt.straggler_spawned = false;
       // 波次间隙弃 2 抽 2
       const discardCount = Math.min(GAP_DISCARD_DRAW, rt.hand.length);
       for (let i = 0; i < discardCount; i++) {
@@ -923,6 +967,7 @@ function runNight(
     duration: rt.timer,
     end_reason: endReason,
     idle_seconds: idleSeconds,
+    empty_field_seconds: emptyFieldSeconds,
     engaged_seconds: engagedSeconds,
     enemies_total: spawnedTotal,
     kills,
@@ -955,7 +1000,7 @@ export function runSingleSimulation(
   seed: number,
   variantName: string = 'current',
   targeting: 'nearest' | 'spread' = 'nearest',
-  options?: ReinforceExperimentOptions
+  options?: NightOptions
 ): SingleRunReport {
   const preset = getPreset(presetName);
   const variant = variantName === 'current' ? null : getVariant(variantName);
