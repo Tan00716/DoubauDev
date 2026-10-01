@@ -229,3 +229,99 @@ describe('I7：数值对齐设计文档基准', () => {
     expect(TOTAL_WAVES).toBe(3);
   });
 });
+
+
+describe('盾墙：激活期间班组承伤 = 70%（质检 N 系列补测）', () => {
+  it('盾墙激活时班组 10 秒掉血 = 10×damage×0.7（两种 dt 一致）', () => {
+    const wolfData = getEnemyData('enemy_wolf')!;
+
+    const runOnce = (dt: number): number => {
+      setupNightArena();
+      gameState.spawnSquad('unit_shieldbearer', { x: 0, z: 0 });
+      const squad = gameState.squads[0];
+      squad.command = 'hold';
+
+      gameState.spawnEnemy('enemy_wolf', { x: 1.0, z: 0 });
+      const wolf = gameState.enemies[0];
+      wolf.health = 1e9;
+      wolf.maxHealth = 1e9;
+
+      // 盾墙：全军承伤 -30%（持续拉长到 100s 覆盖整个计量窗口）
+      gameState.activeEffects.push({
+        type: 'shield_wall',
+        duration: 100,
+        params: { damageReduction: 0.3 },
+      });
+
+      const hpBefore = squad.health;
+      simulate(10, dt);
+      return hpBefore - squad.health;
+    };
+
+    const expected = 10 * wolfData.damage * 0.7;
+    expect(runOnce(1 / 60)).toBeCloseTo(expected, 6);
+    expect(runOnce(1 / 30)).toBeCloseTo(expected, 6);
+  });
+
+  it('未激活盾墙时班组 10 秒掉血 = 10×damage（对照，确认减伤仅来自盾墙）', () => {
+    const wolfData = getEnemyData('enemy_wolf')!;
+    setupNightArena();
+    gameState.spawnSquad('unit_shieldbearer', { x: 0, z: 0 });
+    const squad = gameState.squads[0];
+    squad.command = 'hold';
+
+    gameState.spawnEnemy('enemy_wolf', { x: 1.0, z: 0 });
+    const wolf = gameState.enemies[0];
+    wolf.health = 1e9;
+    wolf.maxHealth = 1e9;
+
+    const hpBefore = squad.health;
+    simulate(10, 1 / 60);
+    expect(hpBefore - squad.health).toBe(10 * wolfData.damage);
+  });
+});
+
+describe('N1：紧急增援出牌预检与退款兜底', () => {
+  it('军令容量满时出牌被拒：战意、手牌、弃牌堆、场上班组均不变', () => {
+    setupNightArena();
+    gameState.warSpirit = 30;
+    gameState.firstTacticFree = false; // 关闭首张免费被动，测付费路径
+    gameState.militaryUsed = gameState.militaryCapacity; // 拉满军令
+
+    const reinforce = getCardData('card_tactic_reinforce')!;
+    gameState.tacticHand = [reinforce];
+
+    const spiritBefore = gameState.warSpirit;
+    const discardBefore = gameState.tacticDiscard.length;
+
+    const ok = gameState.playTacticCard(0, { x: 5, z: 5 });
+
+    expect(ok).toBe(false);
+    expect(gameState.canPlayTacticCard(reinforce)).toBe(false);
+    expect(gameState.warSpirit).toBe(spiritBefore);
+    expect(gameState.tacticHand).toHaveLength(1);
+    expect(gameState.tacticHand[0].card_id).toBe('card_tactic_reinforce');
+    expect(gameState.tacticDiscard.length).toBe(discardBefore);
+    expect(gameState.squads).toHaveLength(0);
+  });
+
+  it('容量充足时正常召唤：扣 15 战意、卡进弃牌堆、应急盾卫入场', () => {
+    setupNightArena();
+    gameState.warSpirit = 30;
+    gameState.firstTacticFree = false; // 关闭首张免费被动，测付费路径
+
+    const reinforce = getCardData('card_tactic_reinforce')!;
+    gameState.tacticHand = [reinforce];
+
+    const ok = gameState.playTacticCard(0, { x: 5, z: 5 });
+
+    expect(ok).toBe(true);
+    expect(gameState.canPlayTacticCard(reinforce)).toBe(true);
+    expect(gameState.warSpirit).toBe(15);
+    expect(gameState.tacticDiscard).toContain(reinforce);
+    expect(gameState.squads).toHaveLength(1);
+    expect(gameState.squads[0].unitId).toBe('unit_shieldbearer');
+    expect(gameState.squads[0].isEmergency).toBe(true);
+    expect(gameState.militaryUsed).toBe(1);
+  });
+});
