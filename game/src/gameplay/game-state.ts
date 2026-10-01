@@ -119,8 +119,8 @@ export class GameState {
   tacticDeck: CardData[] = [];
   tacticDiscard: CardData[] = [];
   damagedCamp: { cardId: string; count: number }[] = [];
-  /** 已付费修复、等待再次落阵（半血入场）的卡（I3 归营堆消费）。 */
-  recalledCards: Set<string> = new Set();
+  /** N4：已付费修复（一次性 50%，含再入场）、等待免费半血落阵的卡及张数（Map 保留计数，同名多张不丢失）。 */
+  recalledPending: Map<string, number> = new Map();
 
   activeEffects: TacticEffect[] = [];
 
@@ -180,7 +180,7 @@ export class GameState {
     this.tacticDeck = [];
     this.tacticDiscard = [];
     this.damagedCamp = [];
-    this.recalledCards = new Set();
+    this.recalledPending = new Map();
     this.activeEffects = [];
     this.waveActive = false;
     this.waveNumber = 0;
@@ -217,8 +217,8 @@ export class GameState {
       .filter((c): c is CardData => !!c)
       .map(c => ({ ...c }));
 
-    // 初始战术牌库
-    const initialTactics = ['card_tactic_fire_oil', 'card_tactic_shield_wall', 'card_tactic_volley', 'card_tactic_rally'];
+    // 初始战术牌库（N3：紧急增援入池 4→5 张——召唤物、夜末消散、15 战意）
+    const initialTactics = ['card_tactic_fire_oil', 'card_tactic_shield_wall', 'card_tactic_volley', 'card_tactic_rally', 'card_tactic_reinforce'];
     this.tacticDeck = this.shuffleArray(initialTactics
       .map(id => getCardData(id))
       .filter((c): c is CardData => !!c)
@@ -545,14 +545,16 @@ export class GameState {
       }
 
       if (this.militaryUsed + data.military_cost > this.militaryCapacity) return false;
-      if (!this.spendGold(card.cost_day)) return false;
-      const isRecall = this.recalledCards.has(cardId);
+      // N4：修复即含再入场——已修复卡落阵不再收 cost_day（费用已在修复时一次性付 50%）
+      const pending = this.recalledPending.get(cardId) ?? 0;
+      const isRecall = pending > 0;
+      if (!isRecall && !this.spendGold(card.cost_day)) return false;
       const ok = this.spawnSquad(unitId, position, false, isRecall);
       if (!ok) {
-        this.addGold(card.cost_day);
+        if (!isRecall) this.addGold(card.cost_day);
         return false;
       }
-      if (isRecall) this.recalledCards.delete(cardId);
+      if (isRecall) this.consumeRecalled(cardId, pending);
       return true;
     }
 
@@ -574,18 +576,26 @@ export class GameState {
       }
 
       if (this.workUsed + data.work_cost > this.workCapacity) return false;
-      if (!this.spendGold(card.cost_day)) return false;
-      const isRecall = this.recalledCards.has(cardId);
-      const ok = this.spawnBuilding(buildingId, position, isRecall);
+      // N4：修复即含再入场——已修复卡落阵不再收 cost_day（费用已在修复时一次性付 50%）
+      const pendingB = this.recalledPending.get(cardId) ?? 0;
+      const isRecallB = pendingB > 0;
+      if (!isRecallB && !this.spendGold(card.cost_day)) return false;
+      const ok = this.spawnBuilding(buildingId, position, isRecallB);
       if (!ok) {
-        this.addGold(card.cost_day);
+        if (!isRecallB) this.addGold(card.cost_day);
         return false;
       }
-      if (isRecall) this.recalledCards.delete(cardId);
+      if (isRecallB) this.consumeRecalled(cardId, pendingB);
       return true;
     }
 
     return false;
+  }
+
+  /** N4：消耗一张「已修复待落阵」计数（同名多张时只减一，不误清）。 */
+  private consumeRecalled(cardId: string, pending: number): void {
+    if (pending <= 1) this.recalledPending.delete(cardId);
+    else this.recalledPending.set(cardId, pending - 1);
   }
 
   /** 同名牌升级：规模 +50%/级（M1 简化：属性路径；A/B 机制分支留待 MVP）。 */
@@ -603,7 +613,7 @@ export class GameState {
     b.health += data.max_durability * 0.5;
   }
 
-  /** 受损归营堆消费（I3）：次日白天花 50% 金币修复，修复后落阵以半血入场。 */
+  /** N4（原 I3）：受损归营堆消费——次日白天一次性 50% 金币修复（含再入场），修复后免费半血落阵。 */
   repairDamagedCard(cardId: string): boolean {
     const entry = this.damagedCamp.find(d => d.cardId === cardId);
     if (!entry || entry.count <= 0) return false;
@@ -617,7 +627,8 @@ export class GameState {
     if (entry.count <= 0) {
       this.damagedCamp = this.damagedCamp.filter(d => d.count > 0);
     }
-    this.recalledCards.add(cardId);
+    // N4：Map 计数——同名多张受损卡各自修复、各自保留一张「免费半血落阵」名额
+    this.recalledPending.set(cardId, (this.recalledPending.get(cardId) ?? 0) + 1);
     eventBus.emit('damaged-camp-changed', {});
     return true;
   }
