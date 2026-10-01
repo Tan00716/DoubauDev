@@ -11,6 +11,9 @@ export class GameUI {
   private gameOverScreen: HTMLElement | null = null;
   private settlementScreen: HTMLElement | null = null;
   private helpOverlay: HTMLElement | null = null;
+  /** 批次二修复：构造期注册的事件监听注销器集合——支持 destroy()，避免多实例（热重载/测试）下监听泄漏、
+   * 游离 DOM 实例继续消费事件并在 getElementById 上抛错（P0 复核同类根因：异常被事件总线吞掉）。 */
+  private disposers: (() => void)[] = [];
 
   constructor(renderer: GameRenderer) {
     this.uiLayer = document.getElementById('ui-layer')!;
@@ -18,25 +21,82 @@ export class GameUI {
     this.createStyles();
     this.showMenu();
 
-    eventBus.on('phase-change', ({ phase }) => this.onPhaseChange(phase));
-    eventBus.on('game-over', ({ victory, day }) => this.showGameOver(victory, day));
-    eventBus.on('gold-changed', () => this.updateResources());
-    eventBus.on('war-spirit-changed', () => this.updateResources());
-    eventBus.on('squad-selected', () => this.updateSquadPanel());
-    eventBus.on('card-played', () => this.updateTacticHand());
-    eventBus.on('military-changed', () => {
-      this.updateResources();
+    this.disposers.push(
+      eventBus.on('phase-change', ({ phase }) => this.onPhaseChange(phase)),
+      eventBus.on('game-over', ({ victory, day }) => this.showGameOver(victory, day)),
+      eventBus.on('gold-changed', () => this.updateResources()),
+      eventBus.on('war-spirit-changed', () => this.updateResources()),
+      eventBus.on('squad-selected', () => this.updateSquadPanel()),
+      eventBus.on('card-played', () => this.updateTacticHand()),
+      eventBus.on('military-changed', () => {
+        this.updateResources();
+        this.updateTacticHand();
+      }),
+      eventBus.on('building-placed', () => this.updateArmoryDeck()),
+      eventBus.on('enemy-spawned', () => this.updateEnemyCount()),
+      eventBus.on('entity-destroyed', () => this.updateEnemyCount()),
+      eventBus.on('entity-upgraded', ({ kind, level }) => this.showInfo(`⬆️ 升级成功：${kind === 'squad' ? '班组' : '建筑'} 提升至 Lv${level + 1}，规模 +50%`)),
+      eventBus.on('damaged-camp-changed', () => {
+        this.updateDamagedCampPanel();
+        this.updateArmoryDeck();
+      }),
+      eventBus.on('wave-preview', (preview: WavePreview) => this.showWavePreview(preview)),
+      // 批次二·新手第 1 夜分阶段引导：波次开始推进教学阶段（波 1 班级指令 / 波 2 战意和打牌 / 波 3 整合）。
+      eventBus.on('wave-started', ({ wave }) => this.onWaveStarted(wave)),
+      eventBus.on('tutorial-dismissed', () => this.onTutorialDismissed()),
+    );
+  }
+
+  /** 注销全部事件监听（测试 / 热重载场景防泄漏；正常游戏单例无需调用）。 */
+  destroy(): void {
+    for (const off of this.disposers) off();
+    this.disposers = [];
+  }
+
+  /** 跳过引导后：撤横幅 + 解锁终章按钮（战术牌解锁与补抽在按钮回调内完成）。 */
+  private onTutorialDismissed(): void {
+    this.hideTutorialBanner();
+    const btnUlt = document.getElementById('btn-ultimate');
+    btnUlt?.removeAttribute('disabled');
+    btnUlt?.removeAttribute('title');
+    (btnUlt as HTMLElement | null)?.style.setProperty('opacity', '1');
+  }
+
+  /** 批次二·新手教学文案（≤30 字，设计文档 UX 章节认知负担控制口径）。 */
+  private static readonly TUTORIAL_STAGES: Record<number, string> = {
+    1: '教学① 点击你的班级，试试驻守 / 集火指令',
+    2: '教学② 班级接敌会涨战意，战意驱动战术牌',
+    3: '教学③ 综合运用指令与战意，守住今夜！',
+  };
+
+  private onWaveStarted(wave: number): void {
+    if (!gameState.isTutorialNight()) return;
+    const text = GameUI.TUTORIAL_STAGES[wave];
+    if (text) this.showTutorialBanner(text);
+  }
+
+  private showTutorialBanner(text: string): void {
+    this.hideTutorialBanner();
+    const hud = this.hudScreen;
+    if (!hud) return;
+    const banner = document.createElement('div');
+    banner.className = 'eh-tutorial-banner';
+    banner.id = 'tutorial-banner';
+    banner.innerHTML = `
+      <div class="eh-tutorial-text">${text}</div>
+      <button class="eh-tutorial-skip" id="btn-skip-tutorial">跳过引导</button>
+    `;
+    hud.appendChild(banner);
+    document.getElementById('btn-skip-tutorial')!.onclick = () => {
+      gameState.dismissTutorial();
+      // 跳过 = 关闭整局新手模式：战术牌层立即解锁并补抽初始手牌（与第 2 局体验一致）
+      gameState.drawTacticCards(3);
       this.updateTacticHand();
-    });
-    eventBus.on('building-placed', () => this.updateArmoryDeck());
-    eventBus.on('enemy-spawned', () => this.updateEnemyCount());
-    eventBus.on('entity-destroyed', () => this.updateEnemyCount());
-    eventBus.on('entity-upgraded', ({ kind, level }) => this.showInfo(`⬆️ 升级成功：${kind === 'squad' ? '班组' : '建筑'} 提升至 Lv${level + 1}，规模 +50%`));
-    eventBus.on('damaged-camp-changed', () => {
-      this.updateDamagedCampPanel();
-      this.updateArmoryDeck();
-    });
-    eventBus.on('wave-preview', (preview: WavePreview) => this.showWavePreview(preview));
+    };
+  }
+
+  private hideTutorialBanner(): void {
+    document.getElementById('tutorial-banner')?.remove();
   }
 
   private createStyles(): void {
@@ -97,6 +157,10 @@ export class GameUI {
       .eh-keep-hp-bar { width:120px; height:8px; background:#333; border-radius:4px; margin-top:4px; overflow:hidden; }
       .eh-keep-hp-fill { height:100%; background:linear-gradient(90deg,#e74c3c,#f1c40f); transition:width 0.3s; }
       .eh-info-text { position:absolute; bottom:160px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,0.7); padding:8px 16px; border-radius:6px; font-size:14px; color:#f1c40f; }
+      .eh-tutorial-banner { position:absolute; top:110px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:14px; background:rgba(30,60,30,0.88); border:1px solid #6dbb6d; padding:10px 18px; border-radius:8px; z-index:60; }
+      .eh-tutorial-text { font-size:15px; color:#c8f7c5; }
+      .eh-tutorial-skip { background:transparent; border:1px solid #6dbb6d; color:#9be09a; font-size:12px; padding:4px 10px; border-radius:4px; cursor:pointer; }
+      .eh-tutorial-skip:hover { background:rgba(109,187,109,0.25); }
       .eh-zoom-controls { position:absolute; bottom:10px; left:10px; display:flex; gap:4px; }
       .eh-zoom-btn { width:32px; height:32px; border-radius:4px; border:1px solid #555; background:#2c3e50; color:#fff; cursor:pointer; font-size:16px; }
       .eh-zoom-btn:hover { background:#4a6278; }
@@ -136,8 +200,13 @@ export class GameUI {
     this.menuScreen = menu;
 
     document.getElementById('btn-start')!.onclick = () => {
-      gameState.startGame();
+      // P0 修复（质检批次一复核）：showHUD 必须先于 startGame 挂载——
+      // startGame 内部 emit('phase-change', day) 时 onPhaseChange 会查找 #btn-night 并置可见，
+      // 若 HUD 尚未创建，getElementById 返回 null，`btnNight!.style` 抛 TypeError 被事件总线吞掉，
+      // 按钮保持 display:none，白天无自动入夜兜底 → 第一局卡死白天。gameState 构造时已 resetGame，
+      // 先挂 HUD 读到的资源值与 startGame 内 reset 后一致，无显示错位。
       this.showHUD();
+      gameState.startGame();
     };
 
     document.getElementById('btn-help')!.onclick = () => {
@@ -275,21 +344,33 @@ export class GameUI {
     const bottomPanel = document.getElementById('bottom-panel');
 
     if (phase === 'day') {
-      badge!.textContent = `白天 · 第 ${gameState.dayCount} 天`;
-      badge!.className = 'eh-phase-badge eh-phase-day';
-      btnNight!.style.display = 'block';
-      btnUlt!.style.display = 'none';
-      btnSettle!.style.display = 'none';
-      enemyCounter!.style.display = 'none';
+      // 防御（P0 复盘）：HUD 未挂载时这些元素可能为 null——用可选链替代强制断言，
+      // 避免事件总线吞掉 TypeError 后 UI 永久失步（根因已在 btn-start/btn-restart 侧修复，此处兜底）。
+      if (badge) badge.textContent = `白天 · 第 ${gameState.dayCount} 天`;
+      if (badge) badge.className = 'eh-phase-badge eh-phase-day';
+      btnNight?.style.setProperty('display', 'block');
+      btnUlt?.style.setProperty('display', 'none');
+      btnSettle?.style.setProperty('display', 'none');
+      enemyCounter?.style.setProperty('display', 'none');
       this.updateArmoryDeck();
       this.updateDamagedCampPanel();
     } else if (phase === 'night') {
-      badge!.textContent = `🌙 夜间 · 第 ${gameState.dayCount} 天`;
-      badge!.className = 'eh-phase-badge eh-phase-night';
-      btnNight!.style.display = 'none';
-      btnUlt!.style.display = 'block';
-      btnSettle!.style.display = 'none';
-      enemyCounter!.style.display = 'block';
+      if (badge) badge.textContent = `🌙 夜间 · 第 ${gameState.dayCount} 天`;
+      if (badge) badge.className = 'eh-phase-badge eh-phase-night';
+      btnNight?.style.setProperty('display', 'none');
+      // 批次二·新手第 1 夜：终章随战术牌层一并锁定（置灰 + 提示），第 2 夜正常开放
+      if (gameState.isTutorialNight()) {
+        btnUlt?.setAttribute('disabled', 'true');
+        btnUlt?.setAttribute('title', '第 2 夜开放');
+        (btnUlt as HTMLElement | null)?.style.setProperty('opacity', '0.4');
+      } else {
+        btnUlt?.removeAttribute('disabled');
+        btnUlt?.removeAttribute('title');
+        (btnUlt as HTMLElement | null)?.style.setProperty('opacity', '1');
+      }
+      btnUlt?.style.setProperty('display', 'block');
+      btnSettle?.style.setProperty('display', 'none');
+      enemyCounter?.style.setProperty('display', 'block');
       this.updateTacticHand();
     } else if (phase === 'night_settlement') {
       this.showSettlement();
@@ -346,6 +427,18 @@ export class GameUI {
   private updateTacticHand(): void {
     const panel = document.getElementById('bottom-panel');
     if (!panel || gameState.phase !== 'night') return;
+
+    // 批次二·新手第 1 夜：战术牌层锁定占位（审计修复项 #8：延迟到第 2 夜开放）
+    if (gameState.isTutorialNight()) {
+      panel.innerHTML = `
+        <div class="eh-card eh-card-dim" style="justify-content:center;min-width:240px;">
+          <div class="eh-card-layer eh-layer-tactic">战术</div>
+          <div class="eh-card-name">🔒 战术牌第 2 夜开放</div>
+          <div class="eh-card-desc">今晚专注指挥班级作战</div>
+        </div>
+      `;
+      return;
+    }
 
     let html = '';
     for (let i = 0; i < gameState.tacticHand.length; i++) {
@@ -553,8 +646,9 @@ export class GameUI {
 
     document.getElementById('btn-restart')!.onclick = () => {
       go.remove();
-      gameState.startGame();
+      // P0 修复同 btn-start：HUD 先挂载再 startGame，保证 phase-change 事件能找到 #btn-night。
       this.showHUD();
+      gameState.startGame();
     };
     document.getElementById('btn-menu')!.onclick = () => {
       go.remove();
