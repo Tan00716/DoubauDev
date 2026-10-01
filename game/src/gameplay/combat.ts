@@ -1,4 +1,4 @@
-import { gameState, type SquadEntity, type EnemyEntity, type BuildingEntity, type Position, getWaveComposition, TOTAL_WAVES, WAVE_GAP_SECONDS, WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC } from './game-state';
+import { gameState, type SquadEntity, type EnemyEntity, type BuildingEntity, type Position, getWaveComposition, TOTAL_WAVES, WAVE_GAP_SECONDS, NIGHT1_WAVE_GAP_SECONDS, STRAGGLER_START_DAY, STRAGGLER_COUNT_PER_GAP, STRAGGLER_GAP_FRACTION, WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC } from './game-state';
 import { getUnitData, getBuildingData, getEnemyData } from '../content/data';
 import { eventBus } from '../core/event-bus';
 import { SpatialGrid } from './spatial-grid';
@@ -268,12 +268,19 @@ function updateBuildings(dt: number): void {
 
 /**
  * I2：显式波次状态机（替代原概率刷怪 `Math.random() < dt/spawnRate`）。
- * 节奏：入夜 5 秒威胁预演 → 波 1 → 清波 → 15 秒间隙（弃 2 抽 2 + 下波预演）→ 波 2 → … → 波 3 清空或 240s 夜时到 → 结夜。
+ * 节奏（批次二·空窗优化后）：入夜 3 秒威胁预演 → 波 1 → 清波 → 波间 10 秒（第 1 夜 6 秒；
+ * 弃 2 抽 2 + 下波预演；第 2 夜起过半时刷「落单残兵」填充空窗）→ 波 2 → … → 波 3 清空或 240s 夜时到 → 结夜。
+ * 空窗口径（与负责人定案指标对齐）：beginNight→endNight 间场上敌人存活数为 0 的累计时长 / 夜总时长。
  */
 function checkWaveProgress(dt: number): void {
   gameState.nightTimer += dt;
 
-  // 夜间每 8 秒补抽 1 张战术牌
+  // 批次二·空窗统计：无敌存活期累计（夜末计入 nightIdleHistory，验收 ≤40%、第 1 夜 ≤50%）
+  if (gameState.enemies.length === 0) {
+    gameState.idleSecondsThisNight += dt;
+  }
+
+  // 夜间每 8 秒补抽 1 张战术牌（新手第 1 夜在 drawTacticCards 入口统一锁定）
   if (gameState.nightTimer - gameState.lastTacticDrawAt >= NIGHT_TACTIC_DRAW_INTERVAL) {
     gameState.lastTacticDrawAt = gameState.nightTimer;
     gameState.drawTacticCards(1);
@@ -282,6 +289,27 @@ function checkWaveProgress(dt: number): void {
   if (!gameState.waveActive) {
     // 波间/首波倒计时
     gameState.gapTimer -= dt;
+
+    // 批次二·间隙事件「落单残兵」：第 2 夜起每个波间过半时确定性刷 2 只狼——
+    // 填充空窗后半段（该段敌人存在即不计入空窗），威胁小、计入击杀奖励；
+    // 不改 waveActive/waveNumber，残兵未被击杀则并入下一波，不干扰波次状态机。
+    if (
+      !gameState.stragglerSpawnedThisGap &&
+      gameState.dayCount >= STRAGGLER_START_DAY &&
+      gameState.waveNumber >= 1 &&
+      gameState.gapTotalSeconds > 0 &&
+      gameState.gapTimer <= gameState.gapTotalSeconds * (1 - STRAGGLER_GAP_FRACTION)
+    ) {
+      gameState.stragglerSpawnedThisGap = true;
+      for (let i = 0; i < STRAGGLER_COUNT_PER_GAP; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        gameState.spawnEnemy('enemy_wolf', {
+          x: Math.cos(angle) * (MAP_SIZE * 0.45),
+          z: Math.sin(angle) * (MAP_SIZE * 0.45),
+        });
+      }
+    }
+
     if (gameState.gapTimer <= 0) {
       spawnWave(gameState.waveNumber + 1);
     }
@@ -292,7 +320,11 @@ function checkWaveProgress(dt: number): void {
       return;
     }
     gameState.waveActive = false;
-    gameState.gapTimer = WAVE_GAP_SECONDS;
+    // 批次二·压缩空窗段：波间 15s→10s；第 1 夜教学节奏 6s（敌少清得快，避免空窗占比超标）。
+    const gapSeconds = gameState.dayCount === 1 ? NIGHT1_WAVE_GAP_SECONDS : WAVE_GAP_SECONDS;
+    gameState.gapTimer = gapSeconds;
+    gameState.gapTotalSeconds = gapSeconds;
+    gameState.stragglerSpawnedThisGap = false;
     gameState.discardAndDrawAtGap();
     gameState.setWavePreview(gameState.waveNumber + 1, gameState.gapTimer);
   }
@@ -320,6 +352,9 @@ function spawnWave(waveNumber: number): void {
       });
     }
   }
+
+  // 批次二：波次开始事件——UI 依据它推进新手第 1 夜分阶段教学横幅（波 1/2/3 三阶段）。
+  eventBus.emit('wave-started', { wave: waveNumber, day: gameState.dayCount });
 }
 
 // 寻敌统一走空间网格（MVP 批次一·性能项）；建筑数量少（≤20）保留暴力扫描。
