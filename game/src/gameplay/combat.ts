@@ -1,4 +1,4 @@
-import { gameState, type SquadEntity, type EnemyEntity, type BuildingEntity, type Position, getWaveComposition, TOTAL_WAVES, WAVE_GAP_SECONDS, NIGHT1_WAVE_GAP_SECONDS, STRAGGLER_START_DAY, STRAGGLER_COUNT_PER_GAP, STRAGGLER_GAP_FRACTION, WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC } from './game-state';
+import { gameState, type SquadEntity, type EnemyEntity, type BuildingEntity, type Position, getWaveComposition, getNightRouteAngles, TOTAL_WAVES, WAVE_GAP_SECONDS, NIGHT1_WAVE_GAP_SECONDS, STRAGGLER_START_DAY, STRAGGLER_COUNT_PER_GAP, STRAGGLER_GAP_FRACTION, WAR_SPIRIT_PER_ENGAGED_SQUAD_PER_SEC } from './game-state';
 import { getUnitData, getBuildingData, getEnemyData } from '../content/data';
 import { eventBus } from '../core/event-bus';
 import { SpatialGrid } from './spatial-grid';
@@ -293,6 +293,9 @@ function checkWaveProgress(dt: number): void {
     // 批次二·间隙事件「落单残兵」：第 2 夜起每个波间过半时确定性刷 2 只狼——
     // 填充空窗后半段（该段敌人存在即不计入空窗），威胁小、计入击杀奖励；
     // 不改 waveActive/waveNumber，残兵未被击杀则并入下一波，不干扰波次状态机。
+    // 批次三·残兵奖励口径旋钮（stragglerMode）：single=减为 1 只 / off=消融关闭（不刷）；
+    // 奖励口径（no_reward/half_reward）在 game-state.removeEnemy 内按 isStraggler 标记结算。
+    // 残兵沿本夜进攻路线进场（与波次敌人同一组路线角，视觉上「掉队归队」而非凭空出现）。
     if (
       !gameState.stragglerSpawnedThisGap &&
       gameState.dayCount >= STRAGGLER_START_DAY &&
@@ -301,12 +304,18 @@ function checkWaveProgress(dt: number): void {
       gameState.gapTimer <= gameState.gapTotalSeconds * (1 - STRAGGLER_GAP_FRACTION)
     ) {
       gameState.stragglerSpawnedThisGap = true;
-      for (let i = 0; i < STRAGGLER_COUNT_PER_GAP; i++) {
-        const angle = Math.random() * Math.PI * 2;
+      const stragglerCount = gameState.stragglerMode === 'single'
+        ? 1
+        : gameState.stragglerMode === 'off'
+          ? 0
+          : STRAGGLER_COUNT_PER_GAP;
+      const routes = getActiveRoutes();
+      for (let i = 0; i < stragglerCount; i++) {
+        const angle = routes[i % routes.length];
         gameState.spawnEnemy('enemy_wolf', {
           x: Math.cos(angle) * (MAP_SIZE * 0.45),
           z: Math.sin(angle) * (MAP_SIZE * 0.45),
-        });
+        }, true);
       }
     }
 
@@ -335,21 +344,41 @@ function checkWaveProgress(dt: number): void {
   }
 }
 
-/** 按显式波次表生成一波敌人（I2）：构成确定，无随机。 */
+/**
+ * 批次三·多路进攻（MVP-AC-07/14）：本夜进攻路线角。
+ * 正常路径 beginNight 已生成 gameState.nightRouteAngles；此兜底（手工置 phase 等测试路径）
+ * 按昼夜数确定性重取——保证任何入口下波次出生都走路线制，且与威胁预演同源。
+ */
+function getActiveRoutes(): number[] {
+  return gameState.nightRouteAngles.length > 0
+    ? gameState.nightRouteAngles
+    : getNightRouteAngles(gameState.dayCount);
+}
+
+/**
+ * 按显式波次表生成一波敌人（I2）：构成确定，无随机。
+ * 批次三·多路进攻：敌人按本夜路线角轮转分配（round-robin），路内 ±0.08 弧度确定性小散布——
+ * 出现方位与威胁预演显示的路线一致（MVP-AC-07），散布确定性保证同夜重放生成位置一致。
+ */
 function spawnWave(waveNumber: number): void {
   gameState.waveNumber = waveNumber;
   gameState.waveActive = true;
   gameState.clearWavePreview();
 
+  const routes = getActiveRoutes();
+  const radius = MAP_SIZE * 0.45;
+  let spawnIndex = 0;
   const entries = getWaveComposition(gameState.dayCount, waveNumber);
   for (const entry of entries) {
     for (let i = 0; i < entry.count; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const radius = MAP_SIZE * 0.45;
+      const route = routes[spawnIndex % routes.length];
+      const jitter = ((spawnIndex % 3) - 1) * 0.08; // 路内确定性散布：-0.08 / 0 / +0.08 轮转
+      const angle = route + jitter;
       gameState.spawnEnemy(entry.enemyId, {
         x: Math.cos(angle) * radius,
         z: Math.sin(angle) * radius,
       });
+      spawnIndex++;
     }
   }
 
