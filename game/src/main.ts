@@ -12,8 +12,8 @@ class Game {
 
   constructor() {
     this.renderer = new GameRenderer('canvas-container');
-    this.ui = new GameUI();
-    (window as any).gameRenderer = this.renderer;
+    // S6：UI 依赖通过构造注入，不再挂 window.gameRenderer 全局
+    this.ui = new GameUI(this.renderer);
     this.running = true;
     this.lastTime = performance.now();
     requestAnimationFrame((t) => this.loop(t));
@@ -27,6 +27,9 @@ class Game {
 
     gameState.deltaTime = dt;
     gameState.lastTick = time;
+
+    // I4：阶段状态机由主循环统一驱动（入夜/天亮过渡不再依赖 setTimeout）
+    gameState.update(dt);
 
     // Update combat logic
     updateCombat(dt);
