@@ -1,0 +1,52 @@
+name: Build and Release
+
+# Steam 上架打包 CI（技规 03-web-tech-spec §4.3）
+# - 打 tag（v*）触发 Windows 构建：npm test → vite build → Electron 打包 → 上传构建产物
+# - workflow_dispatch 允许不打 tag 手动验证 CI 链路
+# 注意：GitHub 只识别仓库根 .github/workflows/；本仓库 game/ 是子目录，
+# 各步骤需 working-directory: game（与 game/electron/README.md 内说明一致）
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: game
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm test
+      - run: npm run electron:build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emberhold-windows
+          path: |
+            game/release/*.exe
+            game/release/*.zip
+
+  build-macos:
+    # macOS 构建（后续多平台上架预留；Steam 首发仅 Windows，可先不跑）
+    runs-on: macos-latest
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+        working-directory: game
+      - run: npm test
+        working-directory: game
+      - run: npm run electron:build:all
+        working-directory: game
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emberhold-macos
+          path: game/release/*.dmg
